@@ -38,7 +38,7 @@ def compute_expert_actions_classic(
     Compute discrete expert actions from state transitions using classic dynamics.
 
     Uses inverse bicycle model to recover (acceleration, steering) from state transition,
-    then finds the closest discrete action index.
+    then finds the closest discrete action indices.
 
     Args:
         x_t, y_t, heading_t: Current position and heading (batch,)
@@ -48,7 +48,8 @@ def compute_expert_actions_classic(
         vehicle_length: Vehicle wheelbase for bicycle model
 
     Returns:
-        action_idx: Discrete action indices (batch,) in range [0, 90]
+        expert_actions: Array of shape (batch, 2) with [accel_idx, steer_idx] per sample
+                       accel_idx in [0, 6], steer_idx in [0, 12]
     """
     batch_size = x_t.shape[0]
 
@@ -104,10 +105,10 @@ def compute_expert_actions_classic(
     accel_idx = np.argmin(np.abs(acceleration[:, None] - ACCELERATION_VALUES[None, :]), axis=1)
     steer_idx = np.argmin(np.abs(steering_approx[:, None] - STEERING_VALUES[None, :]), axis=1)
 
-    # Encode as single action: action = accel_idx * num_steer + steer_idx
-    action_idx = accel_idx * NUM_STEER + steer_idx
+    # Return as (batch, 2) array with [accel_idx, steer_idx] per sample
+    expert_actions = np.stack([accel_idx, steer_idx], axis=1).astype(np.int64)
 
-    return action_idx.astype(np.int64)
+    return expert_actions
 
 
 def compute_expert_actions_from_trajectory(
@@ -132,7 +133,7 @@ def compute_expert_actions_from_trajectory(
         vehicle_length: Vehicle wheelbase
 
     Returns:
-        expert_actions: Discrete action indices (num_agents,)
+        expert_actions: Array of shape (num_agents, 2) with [accel_idx, steer_idx]
         valid_mask: Boolean mask for valid expert actions (num_agents,)
     """
     num_agents = traj_x.shape[0]
@@ -140,7 +141,7 @@ def compute_expert_actions_from_trajectory(
 
     if timestep >= max_timestep:
         # Can't compute action for last timestep
-        return np.zeros(num_agents, dtype=np.int64), np.zeros(num_agents, dtype=bool)
+        return np.zeros((num_agents, 2), dtype=np.int64), np.zeros(num_agents, dtype=bool)
 
     # Extract current and next states
     x_t = traj_x[:, timestep]
@@ -212,7 +213,7 @@ class InverseDynamicsModule:
             timestep: Current environment timestep (relative to init_steps)
 
         Returns:
-            expert_actions: Discrete action indices (num_agents,)
+            expert_actions: Array of shape (num_agents, 2) with [accel_idx, steer_idx]
             valid_mask: Boolean mask for valid expert actions (num_agents,)
         """
         if self.trajectories is None:
@@ -233,29 +234,32 @@ class InverseDynamicsModule:
 
 
 def imitation_loss(
-    policy_logits: Tensor,
+    policy_logits: list[Tensor] | tuple[Tensor, ...],
     expert_actions: Tensor,
     valid_mask: Tensor,
 ) -> Tensor:
     """
-    Compute cross-entropy imitation loss.
+    Compute cross-entropy imitation loss for multi-head discrete actions.
 
     Args:
-        policy_logits: Policy output logits (batch, num_actions)
-        expert_actions: Ground truth action indices (batch,)
+        policy_logits: List/tuple of policy output logits [(batch, 7), (batch, 13)]
+                      for acceleration and steering heads
+        expert_actions: Ground truth action indices (batch, 2) with [accel_idx, steer_idx]
         valid_mask: Boolean mask for valid samples (batch,)
 
     Returns:
-        Cross-entropy loss (scalar), averaged over valid samples
+        Cross-entropy loss (scalar), averaged over valid samples and heads
     """
     if valid_mask.sum() == 0:
-        return torch.tensor(0.0, device=policy_logits.device)
+        return torch.tensor(0.0, device=policy_logits[0].device)
 
-    # Mask out invalid samples
-    valid_logits = policy_logits[valid_mask]
-    valid_actions = expert_actions[valid_mask]
+    # Compute cross-entropy for each action head
+    total_loss = torch.tensor(0.0, device=policy_logits[0].device)
+    for head_idx, logits in enumerate(policy_logits):
+        valid_logits = logits[valid_mask]
+        valid_actions = expert_actions[valid_mask, head_idx]
+        head_loss = torch.nn.functional.cross_entropy(valid_logits, valid_actions)
+        total_loss = total_loss + head_loss
 
-    # Cross-entropy loss
-    loss = torch.nn.functional.cross_entropy(valid_logits, valid_actions)
-
-    return loss
+    # Average over heads
+    return total_loss / len(policy_logits)

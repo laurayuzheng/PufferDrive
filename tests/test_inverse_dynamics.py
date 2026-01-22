@@ -65,9 +65,9 @@ class TestComputeExpertActionsClassic:
             x_t, y_t, heading_t, vx_t, vy_t, x_tp1, y_tp1, heading_tp1, dt
         )
 
-        # Decode actions
-        accel_idx = actions // NUM_STEER
-        steer_idx = actions % NUM_STEER
+        # Actions are now (batch, 2) with [accel_idx, steer_idx]
+        accel_idx = actions[:, 0]
+        steer_idx = actions[:, 1]
 
         # Zero acceleration is index 3, zero steering is index 6
         assert np.all(accel_idx == 3), f"Expected accel_idx=3, got {accel_idx}"
@@ -96,7 +96,7 @@ class TestComputeExpertActionsClassic:
             x_t, y_t, heading_t, vx_t, vy_t, x_tp1, y_tp1, heading_tp1, dt
         )
 
-        accel_idx = actions // NUM_STEER
+        accel_idx = actions[:, 0]
         # Acceleration index should be > 3 (positive acceleration)
         assert np.all(accel_idx > 3), f"Expected accel_idx > 3, got {accel_idx}"
 
@@ -123,7 +123,7 @@ class TestComputeExpertActionsClassic:
             x_t, y_t, heading_t, vx_t, vy_t, x_tp1, y_tp1, heading_tp1, dt
         )
 
-        accel_idx = actions // NUM_STEER
+        accel_idx = actions[:, 0]
         # Acceleration index should be < 3 (negative acceleration)
         assert np.all(accel_idx < 3), f"Expected accel_idx < 3, got {accel_idx}"
 
@@ -149,7 +149,7 @@ class TestComputeExpertActionsClassic:
             x_t, y_t, heading_t, vx_t, vy_t, x_tp1, y_tp1, heading_tp1, dt
         )
 
-        steer_idx = actions % NUM_STEER
+        steer_idx = actions[:, 1]
         # Steering index should be > 6 (positive steering = left turn)
         assert np.all(steer_idx > 6), f"Expected steer_idx > 6, got {steer_idx}"
 
@@ -175,7 +175,7 @@ class TestComputeExpertActionsClassic:
             x_t, y_t, heading_t, vx_t, vy_t, x_tp1, y_tp1, heading_tp1, dt
         )
 
-        steer_idx = actions % NUM_STEER
+        steer_idx = actions[:, 1]
         # Steering index should be < 6 (negative steering = right turn)
         assert np.all(steer_idx < 6), f"Expected steer_idx < 6, got {steer_idx}"
 
@@ -226,8 +226,8 @@ class TestComputeExpertActionsClassic:
             x_t, y_t, heading_t, vx_t, vy_t, x_tp1, y_tp1, heading_tp1, dt
         )
 
-        # Actions should be different
-        assert actions[0] != actions[1], "Batch samples should have different actions"
+        # Actions should be different (compare tuples)
+        assert not np.array_equal(actions[0], actions[1]), "Batch samples should have different actions"
 
     def test_output_dtype(self):
         """Output should be int64."""
@@ -274,13 +274,13 @@ class TestComputeExpertActionsFromTrajectory:
             traj_x, traj_y, traj_heading, traj_valid, timestep=5, dt=dt
         )
 
-        assert expert_actions.shape == (num_agents,)
+        assert expert_actions.shape == (num_agents, 2)
         assert valid_mask.shape == (num_agents,)
         assert np.all(valid_mask)  # All should be valid
 
         # Should be zero acceleration, zero steering
-        accel_idx = expert_actions // NUM_STEER
-        steer_idx = expert_actions % NUM_STEER
+        accel_idx = expert_actions[:, 0]
+        steer_idx = expert_actions[:, 1]
         assert np.all(accel_idx == 3), f"Expected accel_idx=3, got {accel_idx}"
         assert np.all(steer_idx == 6), f"Expected steer_idx=6, got {steer_idx}"
 
@@ -422,7 +422,7 @@ class TestInverseDynamicsModule:
 
         expert_actions, valid_mask = module.get_expert_actions(timestep=5)
 
-        assert expert_actions.shape == (num_agents,)
+        assert expert_actions.shape == (num_agents, 2)
         assert valid_mask.shape == (num_agents,)
 
     def test_get_expert_actions_without_trajectories(self):
@@ -434,18 +434,19 @@ class TestInverseDynamicsModule:
 
 
 class TestImitationLoss:
-    """Test the imitation loss computation."""
+    """Test the imitation loss computation for multi-head discrete actions."""
 
     def test_basic_loss(self):
-        """Test basic cross-entropy loss computation."""
+        """Test basic cross-entropy loss computation with multi-head logits."""
         batch_size = 10
-        num_actions = NUM_DISCRETE_ACTIONS
 
-        # Random logits
-        policy_logits = torch.randn(batch_size, num_actions)
+        # Multi-head logits: (batch, 7) for accel, (batch, 13) for steering
+        accel_logits = torch.randn(batch_size, NUM_ACCEL)
+        steer_logits = torch.randn(batch_size, NUM_STEER)
+        policy_logits = [accel_logits, steer_logits]
 
-        # Expert actions (all same for simplicity)
-        expert_actions = torch.zeros(batch_size, dtype=torch.long)
+        # Expert actions: (batch, 2) with [accel_idx, steer_idx]
+        expert_actions = torch.zeros(batch_size, 2, dtype=torch.long)
 
         # All valid
         valid_mask = torch.ones(batch_size, dtype=torch.bool)
@@ -458,10 +459,11 @@ class TestImitationLoss:
     def test_no_valid_samples(self):
         """Test that loss is zero when no valid samples."""
         batch_size = 10
-        num_actions = NUM_DISCRETE_ACTIONS
 
-        policy_logits = torch.randn(batch_size, num_actions)
-        expert_actions = torch.zeros(batch_size, dtype=torch.long)
+        accel_logits = torch.randn(batch_size, NUM_ACCEL)
+        steer_logits = torch.randn(batch_size, NUM_STEER)
+        policy_logits = [accel_logits, steer_logits]
+        expert_actions = torch.zeros(batch_size, 2, dtype=torch.long)
         valid_mask = torch.zeros(batch_size, dtype=torch.bool)  # All invalid
 
         loss = imitation_loss(policy_logits, expert_actions, valid_mask)
@@ -471,10 +473,11 @@ class TestImitationLoss:
     def test_partial_valid(self):
         """Test loss computation with partially valid samples."""
         batch_size = 10
-        num_actions = NUM_DISCRETE_ACTIONS
 
-        policy_logits = torch.randn(batch_size, num_actions)
-        expert_actions = torch.zeros(batch_size, dtype=torch.long)
+        accel_logits = torch.randn(batch_size, NUM_ACCEL)
+        steer_logits = torch.randn(batch_size, NUM_STEER)
+        policy_logits = [accel_logits, steer_logits]
+        expert_actions = torch.zeros(batch_size, 2, dtype=torch.long)
 
         # Only first 5 valid
         valid_mask = torch.zeros(batch_size, dtype=torch.bool)
@@ -487,16 +490,20 @@ class TestImitationLoss:
     def test_perfect_prediction(self):
         """Test that loss is low when predictions match experts."""
         batch_size = 10
-        num_actions = NUM_DISCRETE_ACTIONS
 
-        # Expert actions
-        expert_actions = torch.randint(0, num_actions, (batch_size,))
+        # Expert actions: random valid indices
+        expert_accel = torch.randint(0, NUM_ACCEL, (batch_size,))
+        expert_steer = torch.randint(0, NUM_STEER, (batch_size,))
+        expert_actions = torch.stack([expert_accel, expert_steer], dim=1)
 
         # Create logits that strongly predict expert actions
-        policy_logits = torch.full((batch_size, num_actions), -10.0)
+        accel_logits = torch.full((batch_size, NUM_ACCEL), -10.0)
+        steer_logits = torch.full((batch_size, NUM_STEER), -10.0)
         for i in range(batch_size):
-            policy_logits[i, expert_actions[i]] = 10.0
+            accel_logits[i, expert_accel[i]] = 10.0
+            steer_logits[i, expert_steer[i]] = 10.0
 
+        policy_logits = [accel_logits, steer_logits]
         valid_mask = torch.ones(batch_size, dtype=torch.bool)
 
         loss = imitation_loss(policy_logits, expert_actions, valid_mask)
@@ -507,17 +514,23 @@ class TestImitationLoss:
     def test_gradient_flow(self):
         """Test that gradients flow through the loss."""
         batch_size = 10
-        num_actions = NUM_DISCRETE_ACTIONS
 
-        policy_logits = torch.randn(batch_size, num_actions, requires_grad=True)
-        expert_actions = torch.randint(0, num_actions, (batch_size,))
+        accel_logits = torch.randn(batch_size, NUM_ACCEL, requires_grad=True)
+        steer_logits = torch.randn(batch_size, NUM_STEER, requires_grad=True)
+        policy_logits = [accel_logits, steer_logits]
+        expert_actions = torch.stack([
+            torch.randint(0, NUM_ACCEL, (batch_size,)),
+            torch.randint(0, NUM_STEER, (batch_size,))
+        ], dim=1)
         valid_mask = torch.ones(batch_size, dtype=torch.bool)
 
         loss = imitation_loss(policy_logits, expert_actions, valid_mask)
         loss.backward()
 
-        assert policy_logits.grad is not None
-        assert policy_logits.grad.shape == policy_logits.shape
+        assert accel_logits.grad is not None
+        assert steer_logits.grad is not None
+        assert accel_logits.grad.shape == accel_logits.shape
+        assert steer_logits.grad.shape == steer_logits.shape
 
 
 class TestEdgeCases:
@@ -543,7 +556,7 @@ class TestEdgeCases:
             x_t, y_t, heading_t, vx_t, vy_t, x_tp1, y_tp1, heading_tp1, dt
         )
 
-        assert actions.shape == (batch_size,)
+        assert actions.shape == (batch_size, 2)
         assert np.all(np.isfinite(actions))
 
     def test_very_slow_speed(self):
@@ -615,7 +628,7 @@ class TestEdgeCases:
 
         assert np.all(np.isfinite(actions))
         # Should detect a small turn, not a large one
-        steer_idx = actions % NUM_STEER
+        steer_idx = actions[:, 1]
         # Steering should be near center (small turn)
         assert np.all(np.abs(steer_idx - 6) <= 4), f"Unexpected large steering: {steer_idx}"
 
@@ -666,8 +679,8 @@ class TestMultiprocessingExpertActions:
 
             expert_actions, expert_valid = vecenv.get_expert_actions()
 
-            # Check shapes
-            assert expert_actions.shape == (32,)
+            # Check shapes: (num_agents, 2) for [accel_idx, steer_idx]
+            assert expert_actions.shape == (32, 2)
             assert expert_valid.shape == (32,)
             assert expert_actions.dtype == np.int64
             assert expert_valid.dtype == bool
@@ -675,10 +688,10 @@ class TestMultiprocessingExpertActions:
             # Serial backend should have valid expert actions
             assert expert_valid.sum() > 0, "Serial backend should return valid expert actions"
 
-            # Actions should be in valid range [0, 90]
+            # Actions should be in valid range: accel_idx in [0, 6], steer_idx in [0, 12]
             valid_actions = expert_actions[expert_valid]
-            assert np.all(valid_actions >= 0)
-            assert np.all(valid_actions <= 90)
+            assert np.all(valid_actions[:, 0] >= 0) and np.all(valid_actions[:, 0] <= 6)
+            assert np.all(valid_actions[:, 1] >= 0) and np.all(valid_actions[:, 1] <= 12)
         finally:
             vecenv.close()
 
@@ -704,8 +717,8 @@ class TestMultiprocessingExpertActions:
 
             expert_actions, expert_valid = vecenv.get_expert_actions()
 
-            # Check shapes (2 envs * 32 agents = 64)
-            assert expert_actions.shape == (64,)
+            # Check shapes (2 envs * 32 agents = 64, 2 for [accel_idx, steer_idx])
+            assert expert_actions.shape == (64, 2)
             assert expert_valid.shape == (64,)
             assert expert_actions.dtype == np.int64
             assert expert_valid.dtype == bool
@@ -713,10 +726,10 @@ class TestMultiprocessingExpertActions:
             # Multiprocessing backend should have valid expert actions
             assert expert_valid.sum() > 0, "Multiprocessing backend should return valid expert actions"
 
-            # Actions should be in valid range [0, 90]
+            # Actions should be in valid range: accel_idx in [0, 6], steer_idx in [0, 12]
             valid_actions = expert_actions[expert_valid]
-            assert np.all(valid_actions >= 0)
-            assert np.all(valid_actions <= 90)
+            assert np.all(valid_actions[:, 0] >= 0) and np.all(valid_actions[:, 0] <= 6)
+            assert np.all(valid_actions[:, 1] >= 0) and np.all(valid_actions[:, 1] <= 12)
         finally:
             vecenv.close()
 

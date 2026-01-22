@@ -180,6 +180,16 @@ The discrete action space has 91 actions (7 acceleration × 13 steering values).
 - `pufferlib/vector.py`: `get_expert_actions()` in Serial and Multiprocessing backends
 - `pufferlib/pufferl.py`: Integration in training loop (lines 468-492)
 
+**Timestep Wrapping for Imitation Learning**:
+
+The `get_expert_action_at_timestep()` method uses modulo to wrap the timestep within episode bounds:
+- Human trajectories have `episode_length` timesteps (e.g., 91)
+- Expert actions are valid for timesteps 0 to `episode_length - 2` (e.g., 0-89)
+- The environment's `tick` is wrapped: `effective_timestep = tick % episode_length`
+- This allows `resample_frequency > episode_length` while maintaining imitation learning
+
+The MoE config uses `resample_frequency = 455` (5 episodes) to balance map loading overhead with scenario diversity. The last timestep of each episode (`tick % 91 == 90`) has no expert action available.
+
 **Usage**:
 ```bash
 # Enable imitation learning

@@ -119,10 +119,11 @@ class PuffeRL:
         self.importance = torch.ones(segments, horizon, device=device)
 
         # Expert actions for imitation learning (if imit_coef > 0)
+        # Always shape (segments, horizon, 2) for [accel_idx, steer_idx]
         self.expert_actions = torch.zeros(
             segments,
             horizon,
-            *atn_space.shape,
+            2,
             device=device,
             dtype=torch.int64,
         )
@@ -319,11 +320,12 @@ class PuffeRL:
                 # Store expert actions for imitation learning if available
                 if config.get("imit_coef", 0) > 0 and hasattr(self.vecenv, "get_expert_actions"):
                     expert_actions, expert_valid = self.vecenv.get_expert_actions()
+                    # expert_actions already matches the current batch from recv()
                     self.expert_actions[batch_rows, l] = torch.as_tensor(
-                        expert_actions[env_id], device=device
+                        expert_actions, device=device
                     )
                     self.expert_valid[batch_rows, l] = torch.as_tensor(
-                        expert_valid[env_id], device=device
+                        expert_valid, device=device
                     )
 
                 # Note: We are not yet handling masks in this version
@@ -467,30 +469,40 @@ class PuffeRL:
             # Add imitation loss if imit_coef > 0
             imit_coef = config.get("imit_coef", 0.0)
             if imit_coef > 0:
-                mb_expert_actions = self.expert_actions[idx]
-                mb_expert_valid = self.expert_valid[idx]
+                mb_expert_actions = self.expert_actions[idx]  # (batch, horizon, 2)
+                mb_expert_valid = self.expert_valid[idx]  # (batch, horizon)
 
-                # Flatten for loss computation
-                if not config["use_rnn"]:
-                    mb_expert_actions = mb_expert_actions.reshape(-1)
-                    mb_expert_valid = mb_expert_valid.reshape(-1)
-                else:
-                    mb_expert_actions = mb_expert_actions.flatten()
-                    mb_expert_valid = mb_expert_valid.flatten()
+                # Reshape for loss computation: (batch * horizon, 2) and (batch * horizon,)
+                mb_expert_actions = mb_expert_actions.reshape(-1, 2)
+                mb_expert_valid = mb_expert_valid.reshape(-1)
 
                 # Compute imitation loss only on valid samples
                 if mb_expert_valid.sum() > 0:
-                    # Get policy logits (handle both discrete multi-head and single-head)
+                    # Get policy logits (must be multi-head for discrete actions)
                     if isinstance(logits, (list, tuple)):
-                        # Multi-head output - concatenate
-                        policy_logits = torch.cat(logits, dim=-1)
+                        if len(logits) == 1 and logits[0].shape[-1] == 91:
+                            # Single flattened action head (91 = 7 accel × 13 steer)
+                            # Convert expert [accel_idx, steer_idx] to flattened index
+                            valid_logits = logits[0][mb_expert_valid]
+                            valid_accel = mb_expert_actions[mb_expert_valid, 0]
+                            valid_steer = mb_expert_actions[mb_expert_valid, 1]
+                            valid_expert = valid_accel * 13 + valid_steer  # Flatten: accel * num_steer + steer
+                            imit_loss = torch.nn.functional.cross_entropy(valid_logits, valid_expert)
+                        else:
+                            # Multi-head output - compute cross-entropy per head
+                            imit_loss = torch.tensor(0.0, device=device)
+                            for head_idx, head_logits in enumerate(logits):
+                                valid_logits = head_logits[mb_expert_valid]
+                                valid_expert = mb_expert_actions[mb_expert_valid, head_idx]
+                                head_loss = torch.nn.functional.cross_entropy(valid_logits, valid_expert)
+                                imit_loss = imit_loss + head_loss
+                            imit_loss = imit_loss / len(logits)  # Average over heads
                     else:
-                        policy_logits = logits
+                        # Single-head (continuous or single discrete) - not expected for Drive
+                        valid_logits = logits[mb_expert_valid]
+                        valid_expert = mb_expert_actions[mb_expert_valid, 0]
+                        imit_loss = torch.nn.functional.cross_entropy(valid_logits, valid_expert)
 
-                    valid_logits = policy_logits[mb_expert_valid]
-                    valid_expert = mb_expert_actions[mb_expert_valid]
-
-                    imit_loss = torch.nn.functional.cross_entropy(valid_logits, valid_expert)
                     loss = loss + imit_coef * imit_loss
                     losses["imit_loss"] += imit_loss.item() / self.total_minibatches
                 else:

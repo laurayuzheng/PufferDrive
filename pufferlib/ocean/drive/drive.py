@@ -384,9 +384,10 @@ class Drive(pufferlib.PufferEnv):
         Compute expert actions for all agents for the entire episode.
 
         Returns:
-            expert_actions: Array of shape (num_agents, episode_length - init_steps - 1)
-                           containing discrete action indices
-            valid_mask: Boolean array of same shape indicating valid expert actions
+            expert_actions: Array of shape (num_agents, episode_length - init_steps - 1, 2)
+                           containing [accel_idx, steer_idx] per timestep
+            valid_mask: Boolean array of shape (num_agents, episode_length - init_steps - 1)
+                       indicating valid expert actions
         """
         from pufferlib.ocean.inverse_dynamics import compute_expert_actions_from_trajectory
 
@@ -402,14 +403,15 @@ class Drive(pufferlib.PufferEnv):
         num_timesteps = traj_x.shape[1]
 
         # Compute expert actions for each timestep (except last)
-        all_expert_actions = np.zeros((num_agents, num_timesteps - 1), dtype=np.int64)
+        # Shape: (num_agents, num_timesteps - 1, 2) for [accel_idx, steer_idx]
+        all_expert_actions = np.zeros((num_agents, num_timesteps - 1, 2), dtype=np.int64)
         all_valid_masks = np.zeros((num_agents, num_timesteps - 1), dtype=bool)
 
         for t in range(num_timesteps - 1):
             expert_actions, valid_mask = compute_expert_actions_from_trajectory(
                 traj_x, traj_y, traj_heading, traj_valid, t, self.dt
             )
-            all_expert_actions[:, t] = expert_actions
+            all_expert_actions[:, t, :] = expert_actions  # (num_agents, 2)
             all_valid_masks[:, t] = valid_mask
 
         return all_expert_actions, all_valid_masks
@@ -418,21 +420,29 @@ class Drive(pufferlib.PufferEnv):
         """
         Get expert actions for current timestep.
 
+        Uses modulo to wrap timestep within episode bounds, allowing imitation learning
+        across multiple episodes within a single resample cycle. This assumes agents
+        respawn to similar initial conditions after each episode.
+
         Args:
             timestep: Current timestep relative to init_steps (i.e., self.tick)
 
         Returns:
-            expert_actions: Discrete action indices (num_agents,)
+            expert_actions: Array of shape (num_agents, 2) with [accel_idx, steer_idx]
             valid_mask: Boolean mask for valid expert actions (num_agents,)
         """
         if not hasattr(self, "_cached_expert_actions"):
             self._cached_expert_actions, self._cached_expert_valid = self.compute_expert_actions()
 
-        if timestep >= self._cached_expert_actions.shape[1]:
-            # Last timestep - no expert action available
-            return np.zeros(self.num_agents, dtype=np.int64), np.zeros(self.num_agents, dtype=bool)
+        # Wrap timestep to cycle through episodes (allows imitation learning with resample_frequency > episode_length)
+        num_expert_timesteps = self._cached_expert_actions.shape[1]  # episode_length - init_steps - 1
+        effective_timestep = timestep % (num_expert_timesteps + 1)  # +1 because episode has one more state than actions
 
-        return self._cached_expert_actions[:, timestep], self._cached_expert_valid[:, timestep]
+        if effective_timestep >= num_expert_timesteps:
+            # Last timestep of episode - no expert action available (no next state to compare)
+            return np.zeros((self.num_agents, 2), dtype=np.int64), np.zeros(self.num_agents, dtype=bool)
+
+        return self._cached_expert_actions[:, effective_timestep, :], self._cached_expert_valid[:, effective_timestep]
 
     def reset_expert_cache(self):
         """Clear cached expert actions (call after resample)."""
