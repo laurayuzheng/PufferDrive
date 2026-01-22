@@ -178,6 +178,31 @@ class Serial:
         for env in self.envs:
             env.close()
 
+    def get_expert_actions(self):
+        """Get expert actions for current timestep from all environments.
+
+        Returns:
+            expert_actions: Array of shape (num_agents,) with discrete action indices
+            valid_mask: Boolean array of same shape indicating valid expert actions
+        """
+        all_expert_actions = []
+        all_valid_masks = []
+
+        for env in self.envs:
+            if hasattr(env, "get_expert_action_at_timestep"):
+                # Use current tick as timestep
+                timestep = getattr(env, "tick", 0)
+                expert_actions, valid_mask = env.get_expert_action_at_timestep(timestep)
+                all_expert_actions.append(expert_actions)
+                all_valid_masks.append(valid_mask)
+            else:
+                # Environment doesn't support expert actions
+                num_agents = env.num_agents
+                all_expert_actions.append(np.zeros(num_agents, dtype=np.int64))
+                all_valid_masks.append(np.zeros(num_agents, dtype=bool))
+
+        return np.concatenate(all_expert_actions), np.concatenate(all_valid_masks)
+
 
 def _worker_process(
     env_creators,
@@ -210,10 +235,28 @@ def _worker_process(
     )
     buf["masks"][:] = True
 
+    # Expert action shared memory buffers for imitation learning
+    expert_actions_arr = np.ndarray(shape, dtype=np.int64, buffer=shm["expert_actions"])[worker_idx]
+    expert_valid_arr = np.ndarray(shape, dtype=bool, buffer=shm["expert_valid"])[worker_idx]
+
     if is_native and num_envs == 1:
         envs = env_creators[0](*env_args[0], **env_kwargs[0], buf=buf, seed=seed)
     else:
         envs = Serial(env_creators, env_args, env_kwargs, num_envs, buf=buf, seed=seed * num_envs)
+
+    # Helper to update expert actions from environment(s)
+    def update_expert_actions():
+        if hasattr(envs, "get_expert_actions"):
+            # Serial backend has get_expert_actions
+            exp_act, exp_valid = envs.get_expert_actions()
+            expert_actions_arr[:] = exp_act
+            expert_valid_arr[:] = exp_valid
+        elif hasattr(envs, "get_expert_action_at_timestep"):
+            # Native PufferEnv (e.g., Drive) has get_expert_action_at_timestep
+            timestep = getattr(envs, "tick", 0)
+            exp_act, exp_valid = envs.get_expert_action_at_timestep(timestep)
+            expert_actions_arr[:] = exp_act
+            expert_valid_arr[:] = exp_valid
 
     semaphores = np.ndarray(num_workers, dtype=np.uint8, buffer=shm["semaphores"])
     notify = np.ndarray(num_workers, dtype=bool, buffer=shm["notify"])
@@ -233,8 +276,10 @@ def _worker_process(
         if sem == RESET:
             seed = recv_pipe.recv()
             _, infos = envs.reset(seed=seed)
+            update_expert_actions()
         elif sem == STEP:
             _, _, _, _, infos = envs.step(atn_arr)
+            update_expert_actions()
         elif sem == CLOSE:
             envs.close()
             send_pipe.send(None)
@@ -347,6 +392,9 @@ class Multiprocessing:
             masks=RawArray("b", num_agents),
             semaphores=RawArray("c", num_workers),
             notify=RawArray("b", num_workers),
+            # Expert action buffers for imitation learning
+            expert_actions=RawArray("q", num_agents),  # int64 for action indices
+            expert_valid=RawArray("b", num_agents),  # bool for validity mask
         )
         shape = (num_workers, agents_per_worker)
         self.obs_batch_shape = (self.agents_per_batch, *obs_shape)
@@ -360,6 +408,9 @@ class Multiprocessing:
             masks=np.ndarray(shape, dtype=bool, buffer=self.shm["masks"]),
             semaphores=np.ndarray(num_workers, dtype=np.uint8, buffer=self.shm["semaphores"]),
             notify=np.ndarray(num_workers, dtype=bool, buffer=self.shm["notify"]),
+            # Expert action buffers
+            expert_actions=np.ndarray(shape, dtype=np.int64, buffer=self.shm["expert_actions"]),
+            expert_valid=np.ndarray(shape, dtype=bool, buffer=self.shm["expert_valid"]),
         )
         self.buf["semaphores"][:] = MAIN
 
@@ -532,6 +583,18 @@ class Multiprocessing:
 
     def notify(self):
         self.buf["notify"][:] = True
+
+    def get_expert_actions(self):
+        """Get expert actions for current timestep from all workers.
+
+        Returns:
+            expert_actions: Array of shape (agents_per_batch,) with discrete action indices
+            valid_mask: Boolean array of same shape indicating valid expert actions
+        """
+        w_slice = self.w_slice
+        expert_actions = self.buf["expert_actions"][w_slice].ravel()
+        expert_valid = self.buf["expert_valid"][w_slice].ravel()
+        return expert_actions, expert_valid
 
     def close(self):
         self.driver_env.close()

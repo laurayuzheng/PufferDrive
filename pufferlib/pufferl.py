@@ -117,6 +117,17 @@ class PuffeRL:
         self.truncations = torch.zeros(segments, horizon, device=device)
         self.ratio = torch.ones(segments, horizon, device=device)
         self.importance = torch.ones(segments, horizon, device=device)
+
+        # Expert actions for imitation learning (if imit_coef > 0)
+        self.expert_actions = torch.zeros(
+            segments,
+            horizon,
+            *atn_space.shape,
+            device=device,
+            dtype=torch.int64,
+        )
+        self.expert_valid = torch.zeros(segments, horizon, device=device, dtype=torch.bool)
+
         self.ep_lengths = torch.zeros(total_agents, device=device, dtype=torch.int32)
         self.ep_indices = torch.arange(total_agents, device=device, dtype=torch.int32)
         self.free_idx = total_agents
@@ -305,6 +316,16 @@ class PuffeRL:
                 self.terminals[batch_rows, l] = d.float()
                 self.values[batch_rows, l] = value.flatten()
 
+                # Store expert actions for imitation learning if available
+                if config.get("imit_coef", 0) > 0 and hasattr(self.vecenv, "get_expert_actions"):
+                    expert_actions, expert_valid = self.vecenv.get_expert_actions()
+                    self.expert_actions[batch_rows, l] = torch.as_tensor(
+                        expert_actions[env_id], device=device
+                    )
+                    self.expert_valid[batch_rows, l] = torch.as_tensor(
+                        expert_valid[env_id], device=device
+                    )
+
                 # Note: We are not yet handling masks in this version
                 self.ep_lengths[env_id] += 1
                 if l + 1 >= config["bptt_horizon"]:
@@ -442,6 +463,49 @@ class PuffeRL:
             entropy_loss = entropy.mean()
 
             loss = pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss
+
+            # Add imitation loss if imit_coef > 0
+            imit_coef = config.get("imit_coef", 0.0)
+            if imit_coef > 0:
+                mb_expert_actions = self.expert_actions[idx]
+                mb_expert_valid = self.expert_valid[idx]
+
+                # Flatten for loss computation
+                if not config["use_rnn"]:
+                    mb_expert_actions = mb_expert_actions.reshape(-1)
+                    mb_expert_valid = mb_expert_valid.reshape(-1)
+                else:
+                    mb_expert_actions = mb_expert_actions.flatten()
+                    mb_expert_valid = mb_expert_valid.flatten()
+
+                # Compute imitation loss only on valid samples
+                if mb_expert_valid.sum() > 0:
+                    # Get policy logits (handle both discrete multi-head and single-head)
+                    if isinstance(logits, (list, tuple)):
+                        # Multi-head output - concatenate
+                        policy_logits = torch.cat(logits, dim=-1)
+                    else:
+                        policy_logits = logits
+
+                    valid_logits = policy_logits[mb_expert_valid]
+                    valid_expert = mb_expert_actions[mb_expert_valid]
+
+                    imit_loss = torch.nn.functional.cross_entropy(valid_logits, valid_expert)
+                    loss = loss + imit_coef * imit_loss
+                    losses["imit_loss"] += imit_loss.item() / self.total_minibatches
+                else:
+                    losses["imit_loss"] += 0.0
+
+            # Add MoE auxiliary losses if policy supports them
+            if hasattr(self.policy, "get_auxiliary_losses"):
+                aux_losses = self.policy.get_auxiliary_losses()
+                for loss_name, aux_loss in aux_losses.items():
+                    coef_key = f"aux_{loss_name}_coef"
+                    coef = config.get(coef_key, 0.0)
+                    if coef > 0 and aux_loss is not None:
+                        loss = loss + coef * aux_loss
+                        losses[f"aux_{loss_name}"] += aux_loss.item() / self.total_minibatches
+
             self.amp_context.__enter__()  # TODO: AMP needs some debugging
 
             # This breaks vloss clipping?
@@ -457,6 +521,14 @@ class PuffeRL:
             losses["clipfrac"] += clipfrac.item() / self.total_minibatches
             losses["importance"] += ratio.mean().item() / self.total_minibatches
 
+            # Log MoE expert usage statistics
+            if hasattr(self.policy, "get_expert_stats"):
+                expert_stats = self.policy.get_expert_stats()
+                for stat_name, stat_value in expert_stats.items():
+                    if stat_name not in losses:
+                        losses[stat_name] = 0.0
+                    losses[stat_name] += stat_value / self.total_minibatches
+
             # Learn on accumulated minibatches
             profile("learn", epoch)
             loss.backward()
@@ -469,6 +541,11 @@ class PuffeRL:
         profile("train_misc", epoch)
         if config["anneal_lr"]:
             self.scheduler.step()
+
+        # Update MoE temperature if policy supports it
+        if hasattr(self.policy, "update_temperature"):
+            progress = self.global_step / config["total_timesteps"]
+            self.policy.update_temperature(progress, config)
 
         y_pred = self.values.flatten()
         y_true = advantages.flatten() + self.values.flatten()
@@ -1435,6 +1512,36 @@ def load_policy(args, vecenv, env_name=""):
         state_dict = torch.load(path, map_location=device)
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
         policy.load_state_dict(state_dict)
+
+    # Load base weights for MoE (partial load with strict=False)
+    # Skip if load_model_path is provided (that checkpoint has everything)
+    base_checkpoint = args.get("policy", {}).get("base_checkpoint")
+    load_model_path = args.get("load_model_path")
+    if base_checkpoint is not None and load_model_path is None:
+        state_dict = torch.load(base_checkpoint, map_location=device)
+        # Strip module. prefix (from DDP) and normalize policy. prefix
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+
+        # Determine target model (inner policy if LSTM-wrapped)
+        target_policy = policy.policy if hasattr(policy, "policy") else policy
+
+        # Filter to only keys that exist in the target (for partial loading)
+        target_keys = set(target_policy.state_dict().keys())
+        filtered_dict = {}
+        for k, v in state_dict.items():
+            # Try with and without policy. prefix
+            key = k.replace("policy.", "")
+            if key in target_keys:
+                filtered_dict[key] = v
+            elif k in target_keys:
+                filtered_dict[k] = v
+
+        missing, unexpected = target_policy.load_state_dict(filtered_dict, strict=False)
+        print(f"Loaded base weights from {base_checkpoint}")
+        print(f"  Loaded keys: {len(filtered_dict)}")
+        print(f"  Missing keys (new MoE params): {len(missing)}")
+        if unexpected:
+            print(f"  Unexpected keys: {unexpected}")
 
     load_path = args["load_model_path"]
     if load_path == "latest":

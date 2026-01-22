@@ -205,6 +205,7 @@ class Drive(pufferlib.PufferEnv):
     def reset(self, seed=0):
         binding.vec_reset(self.c_envs, seed)
         self.tick = 0
+        self.reset_expert_cache()
         return self.observations, []
 
     def step(self, actions):
@@ -277,6 +278,7 @@ class Drive(pufferlib.PufferEnv):
 
             binding.vec_reset(self.c_envs, seed)
             self.terminals[:] = 1
+            self.reset_expert_cache()
         return (self.observations, self.rewards, self.terminals, self.truncations, info)
 
     def get_global_agent_state(self):
@@ -376,6 +378,67 @@ class Drive(pufferlib.PufferEnv):
 
     def close(self):
         binding.vec_close(self.c_envs)
+
+    def compute_expert_actions(self):
+        """
+        Compute expert actions for all agents for the entire episode.
+
+        Returns:
+            expert_actions: Array of shape (num_agents, episode_length - init_steps - 1)
+                           containing discrete action indices
+            valid_mask: Boolean array of same shape indicating valid expert actions
+        """
+        from pufferlib.ocean.inverse_dynamics import compute_expert_actions_from_trajectory
+
+        trajectories = self.get_ground_truth_trajectories()
+
+        # Remove extra dimension if present
+        traj_x = trajectories["x"][:, 0] if trajectories["x"].ndim == 3 else trajectories["x"]
+        traj_y = trajectories["y"][:, 0] if trajectories["y"].ndim == 3 else trajectories["y"]
+        traj_heading = trajectories["heading"][:, 0] if trajectories["heading"].ndim == 3 else trajectories["heading"]
+        traj_valid = trajectories["valid"][:, 0] if trajectories["valid"].ndim == 3 else trajectories["valid"]
+
+        num_agents = traj_x.shape[0]
+        num_timesteps = traj_x.shape[1]
+
+        # Compute expert actions for each timestep (except last)
+        all_expert_actions = np.zeros((num_agents, num_timesteps - 1), dtype=np.int64)
+        all_valid_masks = np.zeros((num_agents, num_timesteps - 1), dtype=bool)
+
+        for t in range(num_timesteps - 1):
+            expert_actions, valid_mask = compute_expert_actions_from_trajectory(
+                traj_x, traj_y, traj_heading, traj_valid, t, self.dt
+            )
+            all_expert_actions[:, t] = expert_actions
+            all_valid_masks[:, t] = valid_mask
+
+        return all_expert_actions, all_valid_masks
+
+    def get_expert_action_at_timestep(self, timestep):
+        """
+        Get expert actions for current timestep.
+
+        Args:
+            timestep: Current timestep relative to init_steps (i.e., self.tick)
+
+        Returns:
+            expert_actions: Discrete action indices (num_agents,)
+            valid_mask: Boolean mask for valid expert actions (num_agents,)
+        """
+        if not hasattr(self, "_cached_expert_actions"):
+            self._cached_expert_actions, self._cached_expert_valid = self.compute_expert_actions()
+
+        if timestep >= self._cached_expert_actions.shape[1]:
+            # Last timestep - no expert action available
+            return np.zeros(self.num_agents, dtype=np.int64), np.zeros(self.num_agents, dtype=bool)
+
+        return self._cached_expert_actions[:, timestep], self._cached_expert_valid[:, timestep]
+
+    def reset_expert_cache(self):
+        """Clear cached expert actions (call after resample)."""
+        if hasattr(self, "_cached_expert_actions"):
+            del self._cached_expert_actions
+            del self._cached_expert_valid
 
 
 def calculate_area(p1, p2, p3):

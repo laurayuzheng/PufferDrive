@@ -185,6 +185,11 @@ MAKE_FUNCTIONS = {
     "multiagent": make_multiagent,
 }
 
+# Aliases that map to existing environments (for config variants like MoE)
+ENV_ALIASES = {
+    "drive_moe": "drive",
+}
+
 
 def env_creator(name="squared", *args, **kwargs):
     if "puffer_" not in name:
@@ -192,6 +197,10 @@ def env_creator(name="squared", *args, **kwargs):
 
     # TODO: Robust sanity / ocean imports
     name = name.replace("puffer_", "")
+
+    # Resolve aliases (e.g., drive_moe -> drive)
+    name = ENV_ALIASES.get(name, name)
+
     try:
         module = importlib.import_module(f"pufferlib.ocean.{name}.{name}")
         return getattr(module, MAKE_FUNCTIONS[name])
