@@ -193,6 +193,9 @@ puffer train puffer_drive_moe
 ```bash
 # Run imitation learning tests (includes Multiprocessing backend tests)
 python -m pytest tests/test_inverse_dynamics.py::TestMultiprocessingExpertActions -v
+
+# Add -s flag to see print statements in test output
+python -m pytest tests/test_inverse_dynamics.py::TestMultiprocessingExpertActions -v -s
 ```
 
 ### Evaluation (`pufferlib/ocean/benchmark/`)
