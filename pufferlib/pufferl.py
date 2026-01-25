@@ -1022,15 +1022,23 @@ class WandbLogger:
     def __init__(self, args, load_id=None, resume="allow"):
         import wandb
 
+        run_id = load_id or wandb.util.generate_id()
+
+        # Build display name: exp_name prefix takes priority, then wandb_name, then None
+        if args.get("exp_name"):
+            display_name = f"{args['exp_name']}_{run_id}"
+        else:
+            display_name = args.get("wandb_name")
+
         wandb.init(
-            id=load_id or wandb.util.generate_id(),
+            id=run_id,
             project=args["wandb_project"],
             group=args["wandb_group"],
             allow_val_change=True,
             save_code=False,
             resume=resume,
             config=args,
-            name=args.get("wandb_name"),
+            name=display_name,
             tags=[args["tag"]] if args["tag"] is not None else [],
         )
         self.wandb = wandb
@@ -1449,13 +1457,23 @@ def export(args=None, env_name=None, vecenv=None, policy=None, path=None, silent
             print(name, param.shape, param.data.cpu().numpy().ravel()[0])
 
     weights = np.concatenate(weights)
-    if path is None:
-        path = f"pufferlib/resources/drive/{args['env_name']}_weights.bin"
 
+    # Priority: explicit path arg > --output-path > default
+    if path is None:
+        path = args.get("output_path")
+    if path is None:
+        path = "resources/drive/puffer_drive_weights.bin"
+
+    # Create parent directories if needed
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     weights.tofile(path)
 
     if not silent:
         print(f"Saved {len(weights)} weights to {path}")
+
+    # Close vectorized environment to terminate worker processes
+    if vecenv is not None:
+        vecenv.close()
 
 
 def ensure_drive_binary():
@@ -1591,12 +1609,14 @@ def load_config(env_name, config_dir=None):
     parser.add_argument("--wandb", action="store_true", help="Use wandb for logging")
     parser.add_argument("--wandb-project", type=str, default="pufferlib")
     parser.add_argument("--wandb-group", type=str, default="debug")
+    parser.add_argument("--exp-name", type=str, default=None, help="Experiment name prefix for W&B run name")
     parser.add_argument("--neptune", action="store_true", help="Use neptune for logging")
     parser.add_argument("--neptune-name", type=str, default="pufferai")
     parser.add_argument("--neptune-project", type=str, default="ablations")
     parser.add_argument("--local-rank", type=int, default=0, help="Used by torchrun for DDP")
     parser.add_argument("--tag", type=str, default=None, help="Tag for experiment")
     parser.add_argument("--sanity-maps", nargs="*", default=None, help="Optional list of sanity map base names to run")
+    parser.add_argument("--output-path", type=str, default=None, help="Output path for exported weights (.bin file)")
     args = parser.parse_known_args()[0]
 
     if config_dir is None:

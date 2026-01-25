@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include "error.h"
 #include "drivenet.h"
+#include "drivenet_moe.h"
 #include "libgen.h"
 #include "../env_config.h"
 #define TRAJECTORY_LENGTH_DEFAULT 91
@@ -191,7 +192,7 @@ static int make_gif_from_frames(const char *pattern, int fps, const char *palett
 
 int eval_gif(const char *map_name, const char *policy_name, int show_grid, int obs_only, int lasers,
              int show_human_logs, int frame_skip, const char *view_mode, const char *output_topdown,
-             const char *output_agent, int num_maps, int zoom_in) {
+             const char *output_agent, int num_maps, int zoom_in, int use_moe) {
 
     // Parse configuration from INI file
     env_init_config conf = {0};
@@ -296,7 +297,16 @@ int eval_gif(const char *map_name, const char *policy_name, int show_grid, int o
 
     Weights *weights = load_weights(policy_name);
     printf("Active agents in map: %d\n", env.active_agent_count);
-    DriveNet *net = init_drivenet(weights, env.active_agent_count, env.dynamics_model);
+
+    // Initialize appropriate network based on use_moe flag
+    DriveNet *net = NULL;
+    DriveNetMoE *net_moe = NULL;
+    if (use_moe) {
+        printf("Using MoE network architecture\n");
+        net_moe = init_drivenet_moe(weights, env.active_agent_count, env.dynamics_model);
+    } else {
+        net = init_drivenet(weights, env.active_agent_count, env.dynamics_model);
+    }
 
     int frame_count = env.episode_length > 0 ? env.episode_length : TRAJECTORY_LENGTH_DEFAULT;
     char filename_topdown[256];
@@ -359,7 +369,11 @@ int eval_gif(const char *map_name, const char *policy_name, int show_grid, int o
                 WriteFrame(&topdown_recorder, img_width, img_height);
                 rendered_frames++;
             }
-            forward(net, env.observations, (int *)env.actions);
+            if (use_moe) {
+                forward_moe(net_moe, env.observations, (int *)env.actions);
+            } else {
+                forward(net, env.observations, (int *)env.actions);
+            }
             c_step(&env);
         }
     }
@@ -377,7 +391,11 @@ int eval_gif(const char *map_name, const char *policy_name, int show_grid, int o
                 WriteFrame(&agent_recorder, img_width, img_height);
                 rendered_frames++;
             }
-            forward(net, env.observations, (int *)env.actions);
+            if (use_moe) {
+                forward_moe(net_moe, env.observations, (int *)env.actions);
+            } else {
+                forward(net, env.observations, (int *)env.actions);
+            }
             c_step(&env);
         }
     }
@@ -399,7 +417,11 @@ int eval_gif(const char *map_name, const char *policy_name, int show_grid, int o
 
     free(client);
     free_allocated(&env);
-    free_drivenet(net);
+    if (use_moe) {
+        free_drivenet_moe(net_moe);
+    } else {
+        free_drivenet(net);
+    }
     free(weights);
     return 0;
 }
@@ -420,6 +442,7 @@ int main(int argc, char *argv[]) {
     const char *output_topdown = NULL;
     const char *output_agent = NULL;
     int num_maps = 1;
+    int use_moe = 0;
 
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
@@ -485,10 +508,12 @@ int main(int argc, char *argv[]) {
                 num_maps = atoi(argv[i + 1]);
                 i++;
             }
+        } else if (strcmp(argv[i], "--moe") == 0) {
+            use_moe = 1;
         }
     }
 
     eval_gif(map_name, policy_name, show_grid, obs_only, lasers, show_human_logs, frame_skip, view_mode, output_topdown,
-             output_agent, num_maps, zoom_in);
+             output_agent, num_maps, zoom_in, use_moe);
     return 0;
 }

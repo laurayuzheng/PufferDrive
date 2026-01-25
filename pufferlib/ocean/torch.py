@@ -344,3 +344,28 @@ class DriveMoE(nn.Module):
         tau_min = config.get("moe_tau_min", 0.1)
         new_temp = self._compute_temperature(progress, tau_max, tau_min)
         self.router.set_temperature(new_temp)
+
+    def forward_with_forced_expert(self, observations, expert_idx, state=None):
+        """Forward pass with a specific expert forced (one-hot).
+
+        Args:
+            observations: Input observations.
+            expert_idx: Index of the expert to force (0 to num_experts-1).
+            state: Optional hidden state (unused, for API compatibility).
+
+        Returns:
+            (actions, value) tuple.
+        """
+        batch_size = observations.shape[0]
+
+        # Create one-hot expert weights
+        forced_probs = torch.zeros(batch_size, self.num_experts, device=observations.device)
+        forced_probs[:, expert_idx] = 1.0
+
+        # Encode observations (this sets self._expert_probs but we'll override)
+        hidden = self.encode_observations(observations, state)
+
+        # Decode with forced expert weights
+        actions, value = self.decode_actions(hidden, expert_probs=forced_probs)
+
+        return actions, value

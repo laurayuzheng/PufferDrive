@@ -1,4 +1,5 @@
 #include "drivenet.h"
+#include "drivenet_moe.h"
 #include <string.h>
 
 // Use this test if the network changes to ensure that the forward pass
@@ -31,45 +32,77 @@ void test_drivenet() {
     free(weights);
 }
 
-void demo() {
-
-    // Note: The settings below are hardcoded for demo purposes. Since the policy was
-    // trained with these exact settings, that changing them may lead to
-    // weird behavior.
+void demo(const char *map_name, const char *policy_name, int use_moe) {
+    // Note: The settings below match the MoE training config (puffer_drive_moe.ini)
     Drive env = {
         .human_agent_idx = 0,
-        .action_type = 0,          // Discrete
-        .dynamics_model = CLASSIC, // Classic dynamics
-        .reward_vehicle_collision = -1.0f,
-        .reward_offroad_collision = -1.0f,
+        .action_type = 0,           // Discrete
+        .dynamics_model = CLASSIC,  // Classic dynamics
+        .reward_vehicle_collision = -0.5f,
+        .reward_offroad_collision = -0.5f,
         .reward_goal = 1.0f,
         .reward_goal_post_respawn = 0.25f,
         .goal_radius = 2.0f,
-        .goal_behavior = 1,
+        .goal_behavior = 0,         // Respawn on goal (matching training)
         .goal_target_distance = 30.0f,
-        .goal_speed = 10.0f,
+        .goal_speed = 100.0f,       // Matching training config
         .dt = 0.1f,
-        .episode_length = 300,
-        .termination_mode = 0,
+        .episode_length = 91,       // Matching training config
+        .termination_mode = 1,      // Matching training config
         .collision_behavior = 0,
         .offroad_behavior = 0,
         .init_steps = 0,
-        .init_mode = 0,
-        .control_mode = 0,
-        .map_name = "resources/drive/map_town_02_carla.bin",
+        .init_mode = INIT_ALL_VALID,
+        .control_mode = CONTROL_VEHICLES,
+        .map_name = map_name,
     };
     allocate(&env);
+
+    // Check if we have any active agents
+    if (env.active_agent_count == 0) {
+        fprintf(stderr, "Error: No active agents found in map '%s'\n", map_name);
+        fprintf(stderr, "  Total objects: %d, Actors created: %d\n", env.num_objects, env.num_actors);
+        free_allocated(&env);
+        return;
+    }
+
+    // Validate human_agent_idx
+    if (env.human_agent_idx >= env.active_agent_count) {
+        printf("Warning: human_agent_idx (%d) >= active_agent_count (%d), setting to 0\n",
+               env.human_agent_idx, env.active_agent_count);
+        env.human_agent_idx = 0;
+    }
+
+    printf("Map loaded: %d active agents, %d static agents, %d total actors\n",
+           env.active_agent_count, env.static_agent_count, env.num_actors);
+
     c_reset(&env);
     c_render(&env);
-    Weights *weights = load_weights("resources/drive/puffer_drive_weights_carla_town12.bin");
-    DriveNet *net = init_drivenet(weights, env.active_agent_count, env.dynamics_model);
+
+    // Load weights and initialize network
+    Weights *weights = load_weights(policy_name);
+    DriveNet *net = NULL;
+    DriveNetMoE *net_moe = NULL;
+
+    if (use_moe) {
+        printf("Using MoE network (DriveNetMoE)\n");
+        net_moe = init_drivenet_moe(weights, env.active_agent_count, env.dynamics_model);
+    } else {
+        printf("Using baseline network (DriveNet)\n");
+        net = init_drivenet(weights, env.active_agent_count, env.dynamics_model);
+    }
 
     int accel_delta = 2;
     int steer_delta = 4;
     while (!WindowShouldClose()) {
         int *actions = (int *)env.actions; // Single integer per agent
 
-        forward(net, env.observations, actions);
+        // Forward pass through appropriate network
+        if (use_moe) {
+            forward_moe(net_moe, env.observations, actions);
+        } else {
+            forward(net, env.observations, actions);
+        }
 
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
             if (env.dynamics_model == CLASSIC) {
@@ -132,7 +165,11 @@ void demo() {
 
     close_client(env.client);
     free_allocated(&env);
-    free_drivenet(net);
+    if (use_moe) {
+        free_drivenet_moe(net_moe);
+    } else {
+        free_drivenet(net);
+    }
     free(weights);
 }
 
@@ -177,9 +214,88 @@ void performance_test() {
     free_allocated(&env);
 }
 
-int main() {
-    // performance_test();
-    demo();
-    // test_drivenet();
+void print_usage(const char *prog_name) {
+    printf("Usage: %s [options]\n", prog_name);
+    printf("Options:\n");
+    printf("  --map-name <path>     Path to map file (default: resources/drive/binaries/training/map_000.bin)\n");
+    printf("  --policy-name <path>  Path to weights file (default: resources/drive/puffer_drive_weights.bin)\n");
+    printf("  --moe                 Use MoE network (DriveNetMoE) instead of baseline (DriveNet)\n");
+    printf("  --num-maps <n>        Number of maps for random selection (default: 100)\n");
+    printf("  --help                Show this help message\n");
+    printf("\nControls:\n");
+    printf("  Hold SHIFT + Arrow keys/WASD to manually control the human agent\n");
+}
+
+int main(int argc, char *argv[]) {
+    // Default values
+    const char *map_name = NULL;
+    const char *policy_name = "resources/drive/puffer_drive_weights.bin";
+    const char *map_dir = "resources/drive/binaries/training";
+    int use_moe = 0;
+    int num_maps = 100;
+    char map_buffer[512];
+
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--map-name") == 0) {
+            if (i + 1 < argc) {
+                map_name = argv[i + 1];
+                i++;
+            } else {
+                fprintf(stderr, "Error: --map-name requires a path argument\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--policy-name") == 0) {
+            if (i + 1 < argc) {
+                policy_name = argv[i + 1];
+                i++;
+            } else {
+                fprintf(stderr, "Error: --policy-name requires a path argument\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--moe") == 0) {
+            use_moe = 1;
+        } else if (strcmp(argv[i], "--num-maps") == 0) {
+            if (i + 1 < argc) {
+                num_maps = atoi(argv[i + 1]);
+                i++;
+            } else {
+                fprintf(stderr, "Error: --num-maps requires a number argument\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--map-dir") == 0) {
+            if (i + 1 < argc) {
+                map_dir = argv[i + 1];
+                i++;
+            } else {
+                fprintf(stderr, "Error: --map-dir requires a path argument\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+
+    // If no map specified, pick a random one from map_dir
+    if (map_name == NULL) {
+        srand(time(NULL));
+        int random_map = rand() % num_maps;
+        sprintf(map_buffer, "%s/map_%03d.bin", map_dir, random_map);
+        map_name = map_buffer;
+        printf("Using random map: %s\n", map_name);
+    } else {
+        printf("Using specified map: %s\n", map_name);
+    }
+
+    printf("Using policy: %s\n", policy_name);
+    printf("MoE mode: %s\n", use_moe ? "enabled" : "disabled");
+
+    demo(map_name, policy_name, use_moe);
+
     return 0;
 }

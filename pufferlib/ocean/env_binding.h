@@ -889,6 +889,116 @@ static PyObject *vec_get_road_edge_polylines(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static PyObject *vec_get_road_line_counts(PyObject *self, PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec)
+        return NULL;
+
+    int total_polylines = 0, total_points = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        int np, tp;
+        c_get_road_line_counts(drive, &np, &tp);
+        total_polylines += np;
+        total_points += tp;
+    }
+    return Py_BuildValue("(ii)", total_polylines, total_points);
+}
+
+static PyObject *vec_get_road_line_polylines(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 5) {
+        PyErr_SetString(PyExc_TypeError, "vec_get_road_line_polylines requires 5 arguments");
+        return NULL;
+    }
+
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec)
+        return NULL;
+
+    PyObject *x_arr = PyTuple_GetItem(args, 1);
+    PyObject *y_arr = PyTuple_GetItem(args, 2);
+    PyObject *lengths_arr = PyTuple_GetItem(args, 3);
+    PyObject *scenario_ids_arr = PyTuple_GetItem(args, 4);
+
+    if (!PyArray_Check(x_arr) || !PyArray_Check(y_arr) || !PyArray_Check(lengths_arr) ||
+        !PyArray_Check(scenario_ids_arr)) {
+        PyErr_SetString(PyExc_TypeError, "All output arrays must be NumPy arrays");
+        return NULL;
+    }
+
+    float *x_base = (float *)PyArray_DATA((PyArrayObject *)x_arr);
+    float *y_base = (float *)PyArray_DATA((PyArrayObject *)y_arr);
+    int *lengths_base = (int *)PyArray_DATA((PyArrayObject *)lengths_arr);
+    int *scenario_ids_base = (int *)PyArray_DATA((PyArrayObject *)scenario_ids_arr);
+
+    int poly_offset = 0, pt_offset = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        int np, tp;
+        c_get_road_line_counts(drive, &np, &tp);
+        c_get_road_line_polylines(drive, &x_base[pt_offset], &y_base[pt_offset], &lengths_base[poly_offset],
+                                  &scenario_ids_base[poly_offset]);
+        poly_offset += np;
+        pt_offset += tp;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_get_road_lane_counts(PyObject *self, PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec)
+        return NULL;
+
+    int total_polylines = 0, total_points = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        int np, tp;
+        c_get_road_lane_counts(drive, &np, &tp);
+        total_polylines += np;
+        total_points += tp;
+    }
+    return Py_BuildValue("(ii)", total_polylines, total_points);
+}
+
+static PyObject *vec_get_road_lane_polylines(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 5) {
+        PyErr_SetString(PyExc_TypeError, "vec_get_road_lane_polylines requires 5 arguments");
+        return NULL;
+    }
+
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec)
+        return NULL;
+
+    PyObject *x_arr = PyTuple_GetItem(args, 1);
+    PyObject *y_arr = PyTuple_GetItem(args, 2);
+    PyObject *lengths_arr = PyTuple_GetItem(args, 3);
+    PyObject *scenario_ids_arr = PyTuple_GetItem(args, 4);
+
+    if (!PyArray_Check(x_arr) || !PyArray_Check(y_arr) || !PyArray_Check(lengths_arr) ||
+        !PyArray_Check(scenario_ids_arr)) {
+        PyErr_SetString(PyExc_TypeError, "All output arrays must be NumPy arrays");
+        return NULL;
+    }
+
+    float *x_base = (float *)PyArray_DATA((PyArrayObject *)x_arr);
+    float *y_base = (float *)PyArray_DATA((PyArrayObject *)y_arr);
+    int *lengths_base = (int *)PyArray_DATA((PyArrayObject *)lengths_arr);
+    int *scenario_ids_base = (int *)PyArray_DATA((PyArrayObject *)scenario_ids_arr);
+
+    int poly_offset = 0, pt_offset = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        int np, tp;
+        c_get_road_lane_counts(drive, &np, &tp);
+        c_get_road_lane_polylines(drive, &x_base[pt_offset], &y_base[pt_offset], &lengths_base[poly_offset],
+                                  &scenario_ids_base[poly_offset]);
+        poly_offset += np;
+        pt_offset += tp;
+    }
+    Py_RETURN_NONE;
+}
+
 static double unpack(PyObject *kwargs, char *key) {
     PyObject *val = PyDict_GetItemString(kwargs, key);
     if (val == NULL) {
@@ -970,6 +1080,14 @@ static PyMethodDef methods[] = {
      "Get road edge polyline counts from vectorized env"},
     {"vec_get_road_edge_polylines", vec_get_road_edge_polylines, METH_VARARGS,
      "Get road edge polylines from vectorized env"},
+    {"vec_get_road_line_counts", vec_get_road_line_counts, METH_VARARGS,
+     "Get road line polyline counts from vectorized env"},
+    {"vec_get_road_line_polylines", vec_get_road_line_polylines, METH_VARARGS,
+     "Get road line polylines from vectorized env"},
+    {"vec_get_road_lane_counts", vec_get_road_lane_counts, METH_VARARGS,
+     "Get road lane polyline counts from vectorized env"},
+    {"vec_get_road_lane_polylines", vec_get_road_lane_polylines, METH_VARARGS,
+     "Get road lane polylines from vectorized env"},
     MY_METHODS,
     {NULL, NULL, 0, NULL}};
 

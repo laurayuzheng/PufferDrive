@@ -373,6 +373,58 @@ class Drive(pufferlib.PufferEnv):
 
         return polylines
 
+    def get_road_line_polylines(self):
+        """Get road line polylines (lane markings) for all scenarios.
+
+        Returns:
+            dict with keys 'x', 'y', 'lengths', 'scenario_id' containing numpy arrays.
+            x, y are flattened point coordinates; lengths indicates points per polyline.
+        """
+        num_polylines, total_points = binding.vec_get_road_line_counts(self.c_envs)
+
+        polylines = {
+            "x": np.zeros(total_points, dtype=np.float32),
+            "y": np.zeros(total_points, dtype=np.float32),
+            "lengths": np.zeros(num_polylines, dtype=np.int32),
+            "scenario_id": np.zeros(num_polylines, dtype=np.int32),
+        }
+
+        binding.vec_get_road_line_polylines(
+            self.c_envs,
+            polylines["x"],
+            polylines["y"],
+            polylines["lengths"],
+            polylines["scenario_id"],
+        )
+
+        return polylines
+
+    def get_road_lane_polylines(self):
+        """Get road lane polylines (lane centers) for all scenarios.
+
+        Returns:
+            dict with keys 'x', 'y', 'lengths', 'scenario_id' containing numpy arrays.
+            x, y are flattened point coordinates; lengths indicates points per polyline.
+        """
+        num_polylines, total_points = binding.vec_get_road_lane_counts(self.c_envs)
+
+        polylines = {
+            "x": np.zeros(total_points, dtype=np.float32),
+            "y": np.zeros(total_points, dtype=np.float32),
+            "lengths": np.zeros(num_polylines, dtype=np.int32),
+            "scenario_id": np.zeros(num_polylines, dtype=np.int32),
+        }
+
+        binding.vec_get_road_lane_polylines(
+            self.c_envs,
+            polylines["x"],
+            polylines["y"],
+            polylines["lengths"],
+            polylines["scenario_id"],
+        )
+
+        return polylines
+
     def render(self):
         binding.vec_render(self.c_envs, 0)
 
@@ -745,6 +797,7 @@ if __name__ == "__main__":
     # Process the train dataset
     process_all_maps(data_folder="data/processed/training")
     # Process the validation/test dataset
-    # process_all_maps(data_folder="data/processed/validation")
+    process_all_maps(data_folder="data/processed/validation")
+    process_all_maps(data_folder="data/processed/testing")
     # # Process the validation_interactive dataset
     # process_all_maps(data_folder="data/processed/validation_interactive")

@@ -67,8 +67,11 @@ puffer eval puffer_drive --eval.wosac-realism-eval True --load-model-path <check
 # Human-replay evaluation
 puffer eval puffer_drive --eval.human-replay-eval True --load-model-path <checkpoint.pt>
 
+# Baseline WOSAC eval
+puffer eval puffer_drive --eval.wosac-realism-eval True --load-model-path experiments/puffer_drive_baseline.pt
+
 # MoE WOSAC eval
-puffer eval puffer_drive_moe --eval.wosac-realism-eval True --load-model-path experiments/puffer_drive_moe_beswxlse.pt
+puffer eval puffer_drive_moe --eval.wosac-realism-eval True --load-model-path experiments/puffer_drive_moe_imit.pt
 ```
 
 Results
@@ -78,6 +81,51 @@ ADE	10.26	18.53	7.12
 Collisions	0.56	1.95	0.26
 Realism	0.746	0.734	0.768
 
+## Exporting Weights for Visualizer
+
+The Raylib visualizer requires weights in a binary format (`.bin`). Export PyTorch checkpoints using:
+
+```bash
+# Export specific checkpoint to visualizer location
+puffer export puffer_drive --load-model-path experiments/puffer_drive_moe_x43lcn11.pt --output-path resources/drive/puffer_drive_weights.bin
+
+# Export latest checkpoint
+puffer export puffer_drive --load-model-path latest --output-path resources/drive/puffer_drive_weights.bin
+
+# Export to default location (pufferlib/resources/drive/puffer_drive_weights.bin)
+puffer export puffer_drive --load-model-path experiments/my_checkpoint.pt
+```
+
+**Paths**:
+- Default export location: `pufferlib/resources/drive/{env_name}_weights.bin`
+- Visualizer expects: `resources/drive/puffer_drive_weights.bin` (hardcoded in `visualize.c:419`)
+
+**Note**: The C visualizer has two network implementations:
+- `drivenet.h`: Baseline `Drive` policy architecture
+- `drivenet_moe.h`: MoE `DriveMoE` policy architecture with LoRA experts
+
+## Visualizing the Policy
+
+To run the visualizer in a pop up:
+```bash
+# Build visualizer
+bash scripts/build_ocean.sh visualize local
+
+# Run baseline policy
+./visualize
+
+# Run MoE policy (use --moe flag)
+./visualize --moe
+```
+
+To run the visualizer headless and export an mp4:
+```bash
+# Baseline
+xvfb-run -s "-screen 0 1280x720x24" ./visualize
+
+# MoE
+xvfb-run -s "-screen 0 1280x720x24" ./visualize --moe
+```
 
 ## Testing
 
@@ -88,7 +136,22 @@ python tests/test_drive_train.py
 
 # Run C INI parser tests
 ./tests/ini_parser/build_n_test.sh
+
+# Test MoE architecture matches between PyTorch and C
+python -m pytest tests/test_moe_architecture.py -v
 ```
+
+### MoE Architecture Test
+
+The `tests/test_moe_architecture.py` test ensures the PyTorch `DriveMoE` architecture matches the C `drivenet_moe.h` implementation. This is critical because weight export order must match weight loading order in C.
+
+The test verifies:
+- Parameter names and shapes match expected order
+- Total weight count matches (635,175 parameters)
+- Exported .bin file size is correct
+- Constants (input_size, hidden_size, num_experts, etc.) match between Python and C
+
+If you modify the MoE architecture in `torch.py`, run this test to see which parameters changed, then update `drivenet_moe.h` accordingly.
 
 ## Code Formatting
 
@@ -211,6 +274,102 @@ python -m pytest tests/test_inverse_dynamics.py::TestMultiprocessingExpertAction
 ### Evaluation (`pufferlib/ocean/benchmark/`)
 
 WOSAC realism metrics and human-replay compatibility evaluation.
+
+### Python Visualization (`pufferlib/visualize/`)
+
+Matplotlib-based visualization utilities for creating publication-quality figures and videos. Inspired by GPUDrive visualization code.
+
+**Modules**:
+- **`color.py`**: Color schemes for roads, agents, and states (matching GPUDrive conventions)
+- **`utils.py`**: Low-level drawing utilities (bounding boxes, trajectories, road polylines, figure-to-image conversion)
+- **`core.py`**: `MatplotlibVisualizer` class for rendering simulator states
+- **`multiverse.py`**: `MultiverseVisualizer` class for MoE expert comparison ("what-if" visualizations)
+
+**Basic Usage**:
+```python
+from pufferlib.visualize import MatplotlibVisualizer, save_img_as_png
+
+# Create visualizer
+vis = MatplotlibVisualizer(env, goal_radius=2.0, figsize=(10, 10), dpi=100)
+
+# Render current state
+img = vis.plot_simulator_state(timestep=0, zoom_radius=80.0)
+save_img_as_png(img, "state.png")
+
+# Render with collision/offroad highlighting
+img = vis.plot_simulator_state(
+    timestep=0,
+    collision_mask=collision_mask,
+    offroad_mask=offroad_mask,
+)
+
+# Render with MoE expert coloring
+img = vis.plot_simulator_state(
+    timestep=0,
+    policy_assignments=np.array([0, 1, 2, 0, 1, 2, ...]),  # Expert index per agent
+)
+
+# Plot ground truth human trajectories
+img = vis.plot_ground_truth_trajectories(max_agents=16)
+
+# 3D rendering mode
+vis_3d = MatplotlibVisualizer(env, render_3d=True)
+img = vis_3d.plot_simulator_state(timestep=0)
+```
+
+**MoE Multiverse Visualization**:
+```python
+from pufferlib.visualize import MultiverseVisualizer
+
+# Create multiverse visualizer
+moe_vis = MultiverseVisualizer(env, policy=None, num_experts=3)
+
+# Compare trajectories from different experts in a grid
+# trajectories_by_expert: Dict[int, Dict] with 'positions' key
+img = moe_vis.plot_multiverse_grid(
+    trajectories_by_expert=trajectories_by_expert,
+    zoom_radius=50.0,
+    title="Expert Comparison",
+)
+
+# Visualize expert routing probabilities over time
+# expert_probs_history: (num_timesteps, num_agents, num_experts)
+img = moe_vis.plot_expert_distribution_over_time(expert_probs_history, agent_indices=[0, 1])
+
+# Color trajectory by active expert at each timestep
+img = moe_vis.plot_trajectory_with_expert_coloring(
+    positions=trajectory,  # (num_steps, 2)
+    expert_assignments=assignments,  # (num_steps,) expert index per step
+)
+```
+
+**Video/GIF Generation**:
+```python
+from pufferlib.visualize.utils import save_frames_as_gif, save_frames_as_video
+
+# Collect frames during rollout
+frames = []
+for step in range(100):
+    img = vis.plot_simulator_state(timestep=step)
+    frames.append(img)
+    obs, reward, done, truncated, info = env.step(action)
+
+# Save as GIF (always works)
+save_frames_as_gif(frames, "rollout.gif", fps=10)
+
+# Save as MP4 (requires imageio[ffmpeg])
+save_frames_as_video(frames, "rollout.mp4", fps=10)
+```
+
+**Testing**:
+```bash
+# Run visualization tests
+python -m pytest tests/test_visualization.py -v
+
+# Test specific components
+python -m pytest tests/test_visualization.py::TestMatplotlibVisualizer -v
+python -m pytest tests/test_visualization.py::TestMultiverseVisualizer -v
+```
 
 ## Data
 

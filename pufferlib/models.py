@@ -195,6 +195,23 @@ class LSTMWrapper(nn.Module):
         state["lstm_c"] = lstm_c.detach()
         return logits, values
 
+    def get_auxiliary_losses(self):
+        """Passthrough to wrapped policy for MoE auxiliary losses."""
+        if hasattr(self.policy, "get_auxiliary_losses"):
+            return self.policy.get_auxiliary_losses()
+        return {}
+
+    def get_expert_stats(self):
+        """Passthrough to wrapped policy for expert usage statistics."""
+        if hasattr(self.policy, "get_expert_stats"):
+            return self.policy.get_expert_stats()
+        return {}
+
+    def update_temperature(self, progress, config):
+        """Passthrough to wrapped policy for temperature annealing."""
+        if hasattr(self.policy, "update_temperature"):
+            self.policy.update_temperature(progress, config)
+
 
 class Convolutional(nn.Module):
     def __init__(
