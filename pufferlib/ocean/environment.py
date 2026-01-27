@@ -188,6 +188,8 @@ MAKE_FUNCTIONS = {
 # Aliases that map to existing environments (for config variants like MoE)
 ENV_ALIASES = {
     "drive_moe": "drive",
+    "drive_mtr": "drive",
+    "drive_mtr_moe": "drive",
 }
 
 

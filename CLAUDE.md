@@ -59,7 +59,7 @@ torchrun --standalone --nnodes=1 --nproc-per-node=6 -m puffer train puffer_drive
 # Training with W&B logging
 puffer train puffer_drive --wandb --wandb-project pufferdrive
 
-puffer train puffer_drive_moe --wandb --wandb-project pufferdrive
+puffer train puffer_drive_moe --wandb --wandb-project pufferdrive --exp-name imit_coef=0.05
 
 # WOSAC realism evaluation
 puffer eval puffer_drive --eval.wosac-realism-eval True --load-model-path <checkpoint.pt>
@@ -68,10 +68,13 @@ puffer eval puffer_drive --eval.wosac-realism-eval True --load-model-path <check
 puffer eval puffer_drive --eval.human-replay-eval True --load-model-path <checkpoint.pt>
 
 # Baseline WOSAC eval
-puffer eval puffer_drive --eval.wosac-realism-eval True --load-model-path experiments/puffer_drive_baseline.pt
+puffer eval puffer_drive --eval.wosac-realism-eval True --load-model-path experiments/puffer_drive_diversity.pt
 
 # MoE WOSAC eval
-puffer eval puffer_drive_moe --eval.wosac-realism-eval True --load-model-path experiments/puffer_drive_moe_imit.pt
+puffer eval puffer_drive_moe --eval.wosac-realism-eval True --load-model-path experiments/puffer_drive_moe_social_forces.pt
+
+# Most recent eval
+puffer eval puffer_drive_mtr  --eval.wosac-realism-eval True --load-model-path experiments/puffer_drive_mtr_base.pt 
 ```
 
 Results
@@ -125,6 +128,63 @@ xvfb-run -s "-screen 0 1280x720x24" ./visualize
 
 # MoE
 xvfb-run -s "-screen 0 1280x720x24" ./visualize --moe
+```
+
+### Matplotlib Visualization (plt_visualize.py)
+
+For more flexible visualization without building C extensions, use the matplotlib-based visualizer:
+
+```bash
+# Basic state visualization (2D)
+python plt_visualize.py --output viz_output/state.png
+
+# Generate rollout GIF with trained policy
+python plt_visualize.py --output viz_output/rollout.gif --checkpoint experiments/puffer_drive_moe_imit.pt --num-steps 50
+
+# 3D rendering
+python plt_visualize.py --output viz_output/state_3d.png --render-3d
+
+# 3D POV mode (camera follows ego vehicle, heading always points up)
+python plt_visualize.py --output viz_output/pov.gif --render-3d --pov --checkpoint experiments/puffer_drive_moe_imit.pt
+
+# MoE multiverse comparison (compare trajectories across experts)
+python plt_visualize.py --output viz_output/multiverse.gif --mode multiverse --checkpoint experiments/puffer_drive_moe_imit.pt
+
+# Ground truth human trajectories
+python plt_visualize.py --output viz_output/trajectories.png --mode trajectories
+
+# Adjust zoom and number of agents
+python plt_visualize.py --output viz_output/zoomed.gif --zoom-radius 30 --num-agents 7
+
+# latest command
+python plt_visualize.py --mode multiverse -o viz_output/multiverse.gif  --pov --forced-agent 2 --scenario 10 --config puffer_drive_moe --checkpoint experiments/puffer_drive_moe_diversity.pt
+```
+
+**Key options**:
+- `--render-3d`: Enable 3D rendering with vehicle cuboids
+- `--pov`: POV mode - camera on top of ego vehicle, rotates with heading (3D only)
+- `--checkpoint`: Path to trained policy checkpoint
+- `--mode`: `state`, `rollout`, `trajectories`, `multiverse`, or `auto` (default)
+- `--zoom-radius`: Viewport radius in meters (default: 80)
+- `--num-steps`: Number of simulation steps for GIF/video
+- `--show-trajectories`: Show trajectory trails in rollout mode
+
+**POV Mode Details**:
+- Camera positioned directly above the ego vehicle
+- View rotates so vehicle heading always points to top of image
+- Auto-zooms to 15m radius for close-up view
+- Ego vehicle highlighted in gold color
+
+### Disabling Training-time Rendering
+
+To disable the C visualizer during training (which runs at `checkpoint_interval`):
+
+```bash
+# Via command line
+puffer train puffer_drive_moe --train.render False
+
+# Or edit config: pufferlib/config/ocean/puffer_drive_moe.ini
+# render = False
 ```
 
 ## Testing
@@ -207,6 +267,95 @@ The Mixture-of-Experts variant implements latent variable modeling for driving s
 - Frozen: `ego_encoder.*`, `road_encoder.*`, `partner_encoder.*`, `shared_embedding.*`, `value_fn.*`
 
 **Important**: When using `LSTMWrapper`, the policy's `encode_observations()` method must return only the hidden tensor (not a tuple). Store auxiliary outputs like `expert_probs` as instance variables and retrieve them in `decode_actions()`.
+
+### MTR Implementation (`pufferlib/ocean/torch_mtr.py`)
+
+The MTR variant uses the full Motion Transformer (MTR) architecture from NeurIPS 2022, adapted for closed-loop RL with MPC-style GMM action output.
+
+**Two architectures**:
+1. **DriveMTR** (baseline): Full MTR backbone, train end-to-end
+2. **DriveMTRMoE**: Frozen backbone + LoRA experts on actor
+
+**GMM Action Head Format (7 values per timestep)**:
+```
+[0] accel: acceleration (direct)
+[1] steer_raw: steering before tanh transform
+[2] log_σ_accel: log std of acceleration
+[3] log_σ_steer: log std of steering
+[4] ρ: correlation coefficient
+[5] vx: predicted velocity x
+[6] vy: predicted velocity y
+```
+
+**Transforms** (from `mtr_actions.py`):
+- `mu_accel = pred[:, :, :, 0]` (direct)
+- `mu_steer = tanh(pred[:, :, :, 1]) * π/3` (scaled to [-60°, +60°])
+
+**Closed-loop execution**:
+1. Take raw `pred_trajs[:, :, 0, 0:2]` (first timestep)
+2. Apply transforms: `accel = [0]`, `steer = tanh([1]) * π/3`
+3. Discretize to action buckets
+
+**Key files**:
+- `pufferlib/ocean/torch_mtr.py`: `DriveMTR` (baseline) and `DriveMTRMoE` policies
+- `pufferlib/ocean/mtr_encoder.py`: Full MTR architecture components with kinematic integration
+- `pufferlib/config/ocean/puffer_drive_mtr.ini`: Baseline MTR configuration
+- `pufferlib/config/ocean/puffer_drive_mtr_moe.ini`: MTR-MoE configuration
+
+**Key parameters** (in `puffer_drive_mtr_moe.ini`):
+- `d_model`: Transformer hidden dimension (default: 128)
+- `nhead`: Number of attention heads (default: 4)
+- `num_encoder_layers`: Encoder self-attention layers (default: 3)
+- `num_decoder_layers`: Decoder cross-attention layers (default: 3)
+- `num_queries`: Intention/action queries (default: 4)
+- `num_future_frames`: GMM trajectory prediction horizon (default: 40)
+- `freeze_base`: Whether to freeze encoder (train LoRA only)
+- `base_checkpoint`: Path to pretrained DriveMTR for weight initialization
+- `aux_reconstruction_coef`: Reconstruction loss weight (default: 50.0)
+
+**Training**:
+```bash
+# Baseline MTR
+puffer train puffer_drive_mtr
+
+# MTR-MoE
+puffer train puffer_drive_mtr_moe
+
+# With W&B logging
+puffer train puffer_drive_mtr_moe --wandb --wandb-project pufferdrive
+
+# Distributed training (6 GPUs)
+torchrun --standalone --nnodes=1 --nproc-per-node=6 -m puffer train puffer_drive_mtr_moe
+
+# Train MoE with frozen backbone (requires pretrained baseline)
+puffer train puffer_drive_mtr_moe --policy.freeze_base True --policy.base_checkpoint experiments/puffer_drive_mtr_base.pt --wandb --wandb-project pufferdrive --exp-name polysona
+
+# Polysona
+puffer train puffer_drive_mtr_moe --wandb --wandb-project pufferdrive --exp-name polysona
+```
+
+**Evaluation**:
+```bash
+# WOSAC realism evaluation
+puffer eval puffer_drive_mtr_moe --eval.wosac-realism-eval True --load-model-path <checkpoint.pt>
+
+# Human-replay evaluation
+puffer eval puffer_drive_mtr_moe --eval.human-replay-eval True --load-model-path <checkpoint.pt>
+```
+
+**Visualization** (use `plt_visualize.py` - C visualizer does not support MTR):
+```bash
+# Rollout GIF
+python plt_visualize.py --output viz_output/rollout.gif --checkpoint experiments/puffer_drive_mtr_moe.pt --num-steps 50 --config puffer_drive_mtr_moe
+
+# Multiverse comparison (MoE experts)
+python plt_visualize.py --mode multiverse --output viz_output/multiverse.gif --checkpoint experiments/puffer_drive_mtr_moe.pt --config puffer_drive_mtr_moe
+
+# 3D POV mode
+python plt_visualize.py --output viz_output/pov.gif --render-3d --pov --checkpoint experiments/puffer_drive_mtr_moe.pt --config puffer_drive_mtr_moe
+```
+
+**Note**: The C visualizer (`./visualize`) only supports `Drive` and `DriveMoE` architectures. Use `plt_visualize.py` for MTR visualization.
 
 ### Imitation Learning (`pufferlib/ocean/inverse_dynamics.py`)
 
@@ -386,3 +535,203 @@ Run `python setup.py build_ext --inplace --force` after modifying:
 - `pufferlib/ocean/drive/drive.c` or `drive.h`
 - `pufferlib/ocean/drive/binding.c`
 - `pufferlib/ocean/drive/visualize.c`
+
+---
+
+## Closed-Loop MTR-MoE: Technical Report
+
+### 1. Introduction and Motivation
+
+The Motion Transformer (MTR) architecture, introduced by Shi et al. (NeurIPS 2022), represents the state-of-the-art in open-loop trajectory prediction for autonomous driving. MTR employs a Transformer-based encoder-decoder architecture with learnable intention queries to capture multi-modal future trajectories. However, the original MTR formulation operates in an **open-loop** setting: given a fixed history of observations, it predicts a distribution over complete future trajectories without considering how predicted actions affect subsequent states.
+
+This work adapts MTR for **closed-loop** reinforcement learning, where the agent must:
+1. Execute actions that affect the environment state
+2. Receive new observations conditioned on previous actions
+3. Optimize long-horizon returns rather than single-step likelihood
+
+We introduce two architectures:
+- **DriveMTR**: A baseline adaptation of MTR for closed-loop RL
+- **DriveMTRMoE**: An extension with Mixture-of-Experts for latent driving style modeling
+
+### 2. Background: Standard MTR Architecture
+
+The original MTR architecture consists of:
+
+**Encoder**: A context encoder that processes agent trajectories and map polylines through separate PointNet-style networks, followed by Transformer self-attention layers that model interactions between all scene elements.
+
+**Decoder**: A query-based Transformer decoder where $K$ learnable intention queries attend to encoded context via cross-attention. Each query specializes in a different motion mode (e.g., turning left, going straight, turning right).
+
+**Output**: For each query $k \in \{1, ..., K\}$, the decoder outputs:
+- A predicted trajectory $\hat{\tau}_k = \{(x_t, y_t)\}_{t=1}^{T}$
+- A confidence score $c_k$ indicating the likelihood of that mode
+
+**Training**: Standard MTR is trained with supervised learning on logged human trajectories using a winner-takes-all loss that backpropagates only through the query closest to ground truth.
+
+### 3. Closed-Loop Adaptations
+
+#### 3.1 MPC-Style Action Extraction
+
+The fundamental challenge in adapting MTR for closed-loop control is converting trajectory predictions into executable actions. Standard MTR outputs position sequences, but the PufferDrive simulator requires discrete acceleration and steering commands.
+
+We adopt an **MPC-style** (Model Predictive Control) approach: predict a full trajectory but execute only the first timestep's action, then re-plan at the next timestep with updated observations.
+
+**GMM Action Head**: Rather than predicting positions directly, our decoder outputs a Gaussian Mixture Model (GMM) over actions at each timestep. Each query $k$ produces a 7-dimensional output per timestep:
+
+$$\mathbf{o}_{k,t} = [\mu_a, \tilde{\mu}_\delta, \log\sigma_a, \log\sigma_\delta, \rho, v_x, v_y]$$
+
+where:
+- $\mu_a$: Mean acceleration (direct output)
+- $\tilde{\mu}_\delta$: Raw steering value (before transformation)
+- $\sigma_a, \sigma_\delta$: Standard deviations for acceleration and steering
+- $\rho$: Correlation coefficient between acceleration and steering
+- $v_x, v_y$: Predicted velocity components
+
+**Steering Transformation**: The raw steering output is transformed to the valid range $[-\pi/3, \pi/3]$ (approximately $\pm 60°$):
+
+$$\mu_\delta = \tanh(\tilde{\mu}_\delta) \cdot \frac{\pi}{3}$$
+
+This bounded transformation ensures kinematically feasible steering angles.
+
+#### 3.2 Query Selection for Action Execution
+
+At inference time, we must select which query's prediction to execute. We introduce **motion classification heads** that output confidence scores $c_k$ for each query:
+
+$$c_k = \text{MLP}(\mathbf{h}_k)$$
+
+where $\mathbf{h}_k$ is the decoded feature for query $k$.
+
+**Training**: We use soft selection via softmax-weighted combination:
+$$\mathbf{a} = \sum_{k=1}^{K} \text{softmax}(c_k) \cdot \mathbf{o}_{k,0}[:2]$$
+
+**Inference**: We use hard selection of the highest-confidence query:
+$$\mathbf{a} = \mathbf{o}_{k^*,0}[:2], \quad k^* = \arg\max_k c_k$$
+
+#### 3.3 Action Discretization
+
+PufferDrive uses a discrete action space with 91 actions (7 acceleration levels × 13 steering levels). We convert continuous GMM outputs to discrete action logits:
+
+$$\text{logit}_{i,j} = -\frac{1}{\tau}\left(|\mu_a - a_i| + |\bar{\mu}_\delta - \delta_j|\right)$$
+
+where $a_i \in \{-4, -2, -1, 0, 1, 2, 4\}$ m/s² and $\delta_j \in [-1, 1]$ are the discrete action values, $\bar{\mu}_\delta = \mu_\delta / (\pi/3)$ normalizes steering to $[-1, 1]$, and $\tau$ is a temperature parameter.
+
+The logits are flattened to a 91-dimensional vector for compatibility with PPO training.
+
+#### 3.4 Kinematic Integration for Trajectory Supervision
+
+While closed-loop execution uses only the first timestep, we retain trajectory prediction as an auxiliary objective. Predicted actions are integrated through a bicycle model to obtain trajectory positions:
+
+**Velocity Integration**:
+$$v_t = v_0 + \sum_{s=1}^{t} \mu_a^{(s)} \cdot \Delta t$$
+
+**Heading Integration**:
+$$\theta_t = \sum_{s=1}^{t} \frac{v_s \cdot \tan(\mu_\delta^{(s)})}{L} \cdot \Delta t$$
+
+where $L$ is the vehicle wheelbase.
+
+**Position Integration**:
+$$x_t = \sum_{s=1}^{t} v_s \cos(\theta_s) \Delta t, \quad y_t = \sum_{s=1}^{t} v_s \sin(\theta_s) \Delta t$$
+
+This kinematic integration guarantees that predicted trajectories are dynamically feasible, unlike position-based predictions that may violate vehicle dynamics.
+
+### 4. DriveMTRMoE: Mixture-of-Experts Extension
+
+#### 4.1 Architecture Overview
+
+DriveMTRMoE extends DriveMTR with latent driving style modeling. The hypothesis is that human driving behavior exhibits distinct styles (e.g., aggressive, conservative, defensive) that manifest more clearly in closed-loop interaction than in open-loop prediction.
+
+**Frozen Backbone**: The MTR encoder can optionally be frozen after pretraining, with only the router and LoRA adapters trained on the RL objective. This enables parameter-efficient fine-tuning.
+
+**LoRA Expert Adapters**: Instead of separate expert networks, we use Low-Rank Adaptation (LoRA) on the actor head:
+
+$$\mathbf{W}_{\text{expert}} = \mathbf{W}_{\text{base}} + \sum_{e=1}^{E} p_e \cdot \mathbf{A}_e \mathbf{B}_e$$
+
+where $\mathbf{A}_e \in \mathbb{R}^{d \times r}$ and $\mathbf{B}_e \in \mathbb{R}^{r \times d}$ are low-rank matrices for expert $e$, $r \ll d$ is the LoRA rank, and $p_e$ is the routing probability for expert $e$.
+
+#### 4.2 Social Forces Router
+
+Expert routing is conditioned on **social forces**—a physics-inspired representation of interactions with neighboring agents:
+
+$$\mathbf{f}_i = \sum_{j \neq i} \frac{\mathbf{r}_{ij}}{|\mathbf{r}_{ij}|^2} \cdot \mathbb{1}[|\mathbf{r}_{ij}| < R]$$
+
+where $\mathbf{r}_{ij}$ is the relative position vector from agent $i$ to agent $j$, and $R$ is the interaction radius.
+
+The router computes expert probabilities:
+$$\mathbf{p} = \text{softmax}\left(\text{MLP}([\mathbf{h}; \mathbf{f}]) / \tau\right)$$
+
+where $\mathbf{h}$ is the decoded context feature, $\mathbf{f}$ is the social force vector, and $\tau$ is the Gumbel-Softmax temperature (annealed during training).
+
+#### 4.3 Reconstruction Loss
+
+To encourage the router to capture meaningful scene structure rather than degenerate solutions, we include a **reconstruction loss** that requires the router's hidden representation to reconstruct the input social forces:
+
+$$\mathcal{L}_{\text{recon}} = \|\hat{\mathbf{f}} - \mathbf{f}\|_2^2$$
+
+where $\hat{\mathbf{f}} = \text{MLP}_{\text{recon}}(\mathbf{z})$ and $\mathbf{z}$ is the router's intermediate representation.
+
+#### 4.4 Training Objectives
+
+The total loss combines multiple objectives:
+
+$$\mathcal{L} = \mathcal{L}_{\text{PPO}} + \lambda_{\text{imit}}\mathcal{L}_{\text{imit}} + \lambda_{\text{kl}}\mathcal{L}_{\text{kl}} + \lambda_{\text{ent}}\mathcal{L}_{\text{ent}} + \lambda_{\text{cos}}\mathcal{L}_{\text{cos}} + \lambda_{\text{recon}}\mathcal{L}_{\text{recon}} + \lambda_{\text{div}}\mathcal{L}_{\text{div}}$$
+
+where:
+- $\mathcal{L}_{\text{PPO}}$: Proximal Policy Optimization loss
+- $\mathcal{L}_{\text{imit}}$: Imitation loss (cross-entropy with expert actions)
+- $\mathcal{L}_{\text{kl}}$: KL divergence encouraging uniform expert usage
+- $\mathcal{L}_{\text{ent}}$: Negative entropy encouraging confident routing
+- $\mathcal{L}_{\text{cos}}$: Cosine similarity penalty for expert weight diversity
+- $\mathcal{L}_{\text{recon}}$: Social forces reconstruction loss
+- $\mathcal{L}_{\text{div}}$: Output diversity loss encouraging different expert behaviors
+
+### 5. Implementation Details
+
+#### 5.1 Architecture Parameters
+
+| Component | Parameter | DriveMTR (minimal) | DriveMTRMoE |
+|-----------|-----------|----------|-------------|
+| Encoder | d_model | 64 | 128 |
+| Encoder | num_layers | 2 | 3 |
+| Encoder | num_heads | 2 | 4 |
+| Decoder | num_layers | 2 | 3 |
+| Decoder | num_queries | 4 | 4 |
+| Decoder | num_future_frames | 40 | 40 |
+| MoE | num_experts | - | 3 |
+| MoE | lora_rank | - | 8 |
+| MoE | lora_alpha | - | 4.0 |
+
+Three configuration tiers are available:
+- **Original** (d_model=256, 6 layers): ~26M params, requires multi-GPU
+- **Lite** (d_model=128, 3 layers): ~3.7M params, requires ~24GB VRAM
+- **Minimal** (d_model=64, 2 layers): ~1M params, fits on 16GB GPU
+
+#### 5.2 Key Differences from Standard MTR
+
+| Aspect | Standard MTR | Closed-Loop MTR |
+|--------|--------------|-----------------|
+| **Training** | Supervised learning | Reinforcement learning (PPO) |
+| **Output** | Position sequences | Action GMM + discretization |
+| **Execution** | Full trajectory | First timestep only (MPC-style) |
+| **Loss** | Winner-takes-all NLL | PPO + imitation + auxiliary |
+| **Temporal context** | Fixed history window | Recurrent state (optional) |
+| **Mode selection** | Post-hoc scoring | Learned confidence heads |
+
+#### 5.3 File Structure
+
+```
+pufferlib/ocean/
+├── torch_mtr.py          # DriveMTR and DriveMTRMoE policy classes
+├── mtr_encoder.py        # MTREncoder, MTRDecoder, kinematic integration
+├── moe_adapters.py       # LoRAExpertsRL, PersonaRouterWithReconstruction
+└── inverse_dynamics.py   # Expert action computation for imitation
+
+pufferlib/config/ocean/
+├── puffer_drive_mtr.ini      # Baseline MTR configuration
+└── puffer_drive_mtr_moe.ini  # MTR-MoE configuration
+```
+
+### 6. References
+
+- Shi, S., et al. "Motion Transformer with Global Intention Localization and Local Movement Refinement." NeurIPS 2022.
+- Hu, E. J., et al. "LoRA: Low-Rank Adaptation of Large Language Models." ICLR 2022.
+- Schulman, J., et al. "Proximal Policy Optimization Algorithms." arXiv 2017.
+- Helbing, D., & Molnár, P. "Social Force Model for Pedestrian Dynamics." Physical Review E, 1995.

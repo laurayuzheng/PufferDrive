@@ -195,10 +195,10 @@ class LSTMWrapper(nn.Module):
         state["lstm_c"] = lstm_c.detach()
         return logits, values
 
-    def get_auxiliary_losses(self):
+    def get_auxiliary_losses(self, config=None):
         """Passthrough to wrapped policy for MoE auxiliary losses."""
         if hasattr(self.policy, "get_auxiliary_losses"):
-            return self.policy.get_auxiliary_losses()
+            return self.policy.get_auxiliary_losses(config=config)
         return {}
 
     def get_expert_stats(self):

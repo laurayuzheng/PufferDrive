@@ -8,6 +8,9 @@ import pufferlib.models
 from pufferlib.models import Default as Policy  # noqa: F401
 from pufferlib.models import Convolutional as Conv  # noqa: F401
 
+# MTR-based policies (import for policy discovery)
+from pufferlib.ocean.torch_mtr import DriveMTR, DriveMTRMoE  # noqa: F401
+
 
 Recurrent = pufferlib.models.LSTMWrapper
 
@@ -133,15 +136,28 @@ class DriveMoE(nn.Module):
         router_hidden_dim=64,
         freeze_base=True,
         expert_prior=None,
+        use_social_forces_routing=False,
+        social_forces_only=False,
         **kwargs,
     ):
+        """
+        Args:
+            use_social_forces_routing: If True, use social forces for routing instead of
+                learned features. Social forces capture the "social situation" (crowding,
+                neighbor velocities) to inform expert selection.
+            social_forces_only: If True (and use_social_forces_routing=True), use only
+                social forces for routing. If False, fuse social forces with encoded
+                context features.
+        """
         super().__init__()
         from pufferlib.ocean.moe_adapters import (
             LoRAExpertsRL,
             PersonaRouter,
+            SocialForcesRouter,
             kl_divergence_loss,
             entropy_loss,
             expert_cosine_loss,
+            expert_output_diversity_loss,
             compute_temperature,
         )
 
@@ -154,10 +170,15 @@ class DriveMoE(nn.Module):
         self.road_features = env.road_features
         self.road_features_after_onehot = env.road_features + 6
 
+        # Social forces routing config
+        self.use_social_forces_routing = use_social_forces_routing
+        self.social_forces_only = social_forces_only
+
         # Store loss functions as methods
         self._kl_divergence_loss = kl_divergence_loss
         self._entropy_loss = entropy_loss
         self._expert_cosine_loss = expert_cosine_loss
+        self._expert_output_diversity_loss = expert_output_diversity_loss
         self._compute_temperature = compute_temperature
 
         # Expert prior for KL loss (e.g., [0.3, 0.6, 0.1] from open-loop)
@@ -195,12 +216,22 @@ class DriveMoE(nn.Module):
             pufferlib.pytorch.layer_init(nn.Linear(3 * input_size, hidden_size)),
         )
 
-        # Router: predicts expert probabilities from concatenated encoder features
-        self.router = PersonaRouter(
-            input_dim=3 * input_size,
-            num_experts=num_experts,
-            hidden_dim=router_hidden_dim,
-        )
+        # Router: predicts expert probabilities
+        if use_social_forces_routing:
+            # Social forces router uses physics-based features for routing
+            self.router = SocialForcesRouter(
+                num_experts=num_experts,
+                hidden_dim=router_hidden_dim,
+                use_context_features=not social_forces_only,
+                context_dim=3 * input_size,  # concat_features dimension
+            )
+        else:
+            # Standard router uses learned features
+            self.router = PersonaRouter(
+                input_dim=3 * input_size,
+                num_experts=num_experts,
+                hidden_dim=router_hidden_dim,
+            )
 
         # Action space setup
         self.is_continuous = isinstance(env.single_action_space, pufferlib.spaces.Box)
@@ -274,21 +305,20 @@ class DriveMoE(nn.Module):
         concat_features = torch.cat([ego_features, road_features, partner_features], dim=1)
 
         # Router prediction (before shared embedding for richer features)
-        expert_probs, router_logits = self.router(concat_features, hard=not self.training)
+        if self.use_social_forces_routing:
+            # Social forces router uses raw partner observations
+            expert_probs, router_logits = self.router(
+                partner_obs=partner_objects,
+                context_features=concat_features if not self.social_forces_only else None,
+                hard=not self.training,
+            )
+        else:
+            # Standard router uses encoded features
+            expert_probs, router_logits = self.router(concat_features, hard=not self.training)
 
         # Store for auxiliary losses
         self._expert_probs = expert_probs
         self._router_logits = router_logits
-
-        # Compute auxiliary losses during training
-        if self.training:
-            self._aux_losses = {
-                "kl": self._kl_divergence_loss(expert_probs, prior=self.expert_prior),
-                "entropy": self._entropy_loss(expert_probs),
-                "cosine": self._expert_cosine_loss(
-                    self.actor.expert_A, self.actor.expert_B
-                ),
-            }
 
         # Track expert usage
         with torch.no_grad():
@@ -299,6 +329,23 @@ class DriveMoE(nn.Module):
 
         # Shared embedding
         embedding = F.relu(self.shared_embedding(concat_features))
+
+        # Compute auxiliary losses during training (after embedding is ready for output_div loss)
+        if self.training:
+            self._aux_losses = {
+                "kl": self._kl_divergence_loss(expert_probs, prior=self.expert_prior),
+                "entropy": self._entropy_loss(expert_probs),
+                "cosine": self._expert_cosine_loss(
+                    self.actor.expert_A, self.actor.expert_B
+                ),
+                # Output diversity loss (gated by coefficient in pufferl.py)
+                # Set to None here - it will be computed lazily if coefficient > 0
+                "output_div": None,
+            }
+            # Store embedding for lazy output_div computation
+            self._cached_embedding = embedding
+        else:
+            self._cached_embedding = None
 
         return embedding
 
@@ -319,8 +366,27 @@ class DriveMoE(nn.Module):
 
         return action, value
 
-    def get_auxiliary_losses(self):
-        """Return auxiliary losses for training integration."""
+    def get_auxiliary_losses(self, config=None):
+        """Return auxiliary losses for training integration.
+
+        Args:
+            config: Optional config dict. If provided and aux_output_div_coef > 0,
+                    computes the output diversity loss lazily.
+        """
+        # Compute output diversity loss lazily if coefficient is set and > 0
+        if (
+            config is not None
+            and self._aux_losses.get("output_div") is None
+            and self._cached_embedding is not None
+        ):
+            output_div_coef = config.get("aux_output_div_coef", 0.0)
+            if output_div_coef > 0:
+                self._aux_losses["output_div"] = self._expert_output_diversity_loss(
+                    self._cached_embedding,
+                    self.actor,
+                    self.atn_dim,
+                )
+
         return self._aux_losses
 
     def get_expert_stats(self):

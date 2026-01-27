@@ -510,7 +510,7 @@ class PuffeRL:
 
             # Add MoE auxiliary losses if policy supports them
             if hasattr(self.policy, "get_auxiliary_losses"):
-                aux_losses = self.policy.get_auxiliary_losses()
+                aux_losses = self.policy.get_auxiliary_losses(config=config)
                 for loss_name, aux_loss in aux_losses.items():
                     coef_key = f"aux_{loss_name}_coef"
                     coef = config.get(coef_key, 0.0)
@@ -681,7 +681,15 @@ class PuffeRL:
         if os.path.exists(model_path):
             return model_path
 
-        torch.save(self.uncompiled_policy.state_dict(), model_path)
+        # Save model with config for reproducibility
+        checkpoint = {
+            "state_dict": self.uncompiled_policy.state_dict(),
+            "policy_config": self.config.get("policy", {}),
+            "policy_name": self.config.get("policy_name", ""),
+            "rnn_name": self.config.get("rnn_name", None),
+            "rnn_config": self.config.get("rnn", {}),
+        }
+        torch.save(checkpoint, model_path)
 
         state = {
             "optimizer_state_dict": self.optimizer.state_dict(),
@@ -1578,12 +1586,14 @@ def load_policy(args, vecenv, env_name=""):
         load_path = max(glob.glob(f"experiments/{env_name}*.pt"), key=os.path.getctime)
 
     if load_path is not None:
-        state_dict = torch.load(load_path, map_location=device)
+        checkpoint = torch.load(load_path, map_location=device)
+        # Handle new checkpoint format with nested state_dict
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-        policy.load_state_dict(state_dict)
-        # state_path = os.path.join(*load_path.split('/')[:-1], 'state.pt')
-        # optim_state = torch.load(state_path)['optimizer_state_dict']
-        # pufferl.optimizer.load_state_dict(optim_state)
+        policy.load_state_dict(state_dict, strict=False)
 
     return policy
 
