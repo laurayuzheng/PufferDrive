@@ -202,6 +202,10 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->goal_target_distance = (float)unpack(kwargs, "goal_target_distance");
     env->goal_radius = (float)unpack(kwargs, "goal_radius");
     env->goal_speed = (float)unpack(kwargs, "goal_speed");
+    // predict_goal: if 1, zero out goal in observations (policy predicts its own goal)
+    env->predict_goal = (kwargs && PyDict_GetItemString(kwargs, "predict_goal"))
+                            ? (int)unpack(kwargs, "predict_goal")
+                            : 0;
     char *map_dir = unpack_str(kwargs, "map_dir");
     int map_id = unpack(kwargs, "map_id");
     int max_agents = unpack(kwargs, "max_agents");

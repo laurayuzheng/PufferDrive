@@ -43,6 +43,7 @@ class Drive(pufferlib.PufferEnv):
         control_mode="control_vehicles",
         map_dir="resources/drive/binaries/training",
         use_all_maps=False,
+        predict_goal=False,
     ):
         # env
         self.dt = dt
@@ -64,6 +65,7 @@ class Drive(pufferlib.PufferEnv):
         self.termination_mode = termination_mode
         self.resample_frequency = resample_frequency
         self.dynamics_model = dynamics_model
+        self.predict_goal = predict_goal
 
         # Observation space calculation
         self.ego_features = {"classic": binding.EGO_FEATURES_CLASSIC, "jerk": binding.EGO_FEATURES_JERK}.get(
@@ -197,6 +199,7 @@ class Drive(pufferlib.PufferEnv):
                 init_mode=self.init_mode,
                 control_mode=self.control_mode,
                 map_dir=map_dir,
+                predict_goal=int(self.predict_goal),
             )
             env_ids.append(env_id)
 
@@ -272,6 +275,7 @@ class Drive(pufferlib.PufferEnv):
                     init_mode=self.init_mode,
                     control_mode=self.control_mode,
                     map_dir=self.map_dir,
+                    predict_goal=int(self.predict_goal),
                 )
                 env_ids.append(env_id)
             self.c_envs = binding.vectorize(*env_ids)
@@ -431,6 +435,71 @@ class Drive(pufferlib.PufferEnv):
     def close(self):
         binding.vec_close(self.c_envs)
 
+    def get_agent_positions(self):
+        """Get current agent positions in local (mean-centered) coordinates.
+
+        Returns:
+            dict with keys 'x', 'y', 'heading' containing numpy arrays of shape (num_agents,)
+        """
+        num_agents = self.num_agents
+
+        positions = {
+            "x": np.zeros(num_agents, dtype=np.float32),
+            "y": np.zeros(num_agents, dtype=np.float32),
+            "heading": np.zeros(num_agents, dtype=np.float32),
+        }
+
+        binding.vec_get_agent_positions(
+            self.c_envs,
+            positions["x"],
+            positions["y"],
+            positions["heading"],
+        )
+
+        return positions
+
+    def get_logged_goals_ego_frame(self):
+        """Get logged trajectory endpoints (init_goal) in ego-centric coordinates.
+
+        The logged goals are the original trajectory endpoints from the dataset,
+        transformed to each agent's local coordinate frame.
+
+        Returns:
+            goal_x: numpy array of shape (num_agents,) - x coordinate in ego frame
+            goal_y: numpy array of shape (num_agents,) - y coordinate in ego frame
+            valid: numpy array of shape (num_agents,) - validity mask (1 if valid, 0 otherwise)
+        """
+        num_agents = self.num_agents
+
+        goal_x = np.zeros(num_agents, dtype=np.float32)
+        goal_y = np.zeros(num_agents, dtype=np.float32)
+        valid = np.zeros(num_agents, dtype=np.int32)
+
+        binding.vec_get_logged_goals_ego_frame(
+            self.c_envs,
+            goal_x,
+            goal_y,
+            valid,
+        )
+
+        return goal_x, goal_y, valid
+
+    def set_predicted_goals(self, goal_x, goal_y):
+        """Set predicted goals from policy output.
+
+        Args:
+            goal_x: numpy array of shape (num_agents,) - x coordinate in ego-centric scaled space
+            goal_y: numpy array of shape (num_agents,) - y coordinate in ego-centric scaled space
+
+        The goals are in the same scaled coordinate space as observations (0.005 scale factor).
+        They will be transformed to world coordinates internally.
+        """
+        binding.vec_set_predicted_goals(
+            self.c_envs,
+            goal_x.astype(np.float32),
+            goal_y.astype(np.float32),
+        )
+
     def compute_expert_actions(self):
         """
         Compute expert actions for all agents for the entire episode.
@@ -501,6 +570,81 @@ class Drive(pufferlib.PufferEnv):
         if hasattr(self, "_cached_expert_actions"):
             del self._cached_expert_actions
             del self._cached_expert_valid
+
+    def get_future_trajectory_at_timestep(self, timestep, num_future_frames=40):
+        """
+        Get ground truth future trajectory at current timestep in local (ego-centric) coordinates.
+
+        The trajectory is transformed to local frame: centered at current position,
+        rotated so that current heading points in the +x direction.
+
+        Args:
+            timestep: Current timestep relative to init_steps (i.e., self.tick)
+            num_future_frames: Number of future frames to return
+
+        Returns:
+            future_traj: Array of shape (num_agents, num_future_frames, 2) with [x, y] in local frame
+            valid_mask: Boolean mask of shape (num_agents, num_future_frames) for valid positions
+        """
+        if not hasattr(self, "_cached_gt_traj"):
+            trajectories = self.get_ground_truth_trajectories()
+            # Remove extra dimension if present
+            self._cached_gt_traj = {
+                "x": trajectories["x"][:, 0] if trajectories["x"].ndim == 3 else trajectories["x"],
+                "y": trajectories["y"][:, 0] if trajectories["y"].ndim == 3 else trajectories["y"],
+                "heading": trajectories["heading"][:, 0] if trajectories["heading"].ndim == 3 else trajectories["heading"],
+                "valid": trajectories["valid"][:, 0] if trajectories["valid"].ndim == 3 else trajectories["valid"],
+            }
+
+        traj_x = self._cached_gt_traj["x"]
+        traj_y = self._cached_gt_traj["y"]
+        traj_heading = self._cached_gt_traj["heading"]
+        traj_valid = self._cached_gt_traj["valid"]
+
+        num_agents = traj_x.shape[0]
+        num_timesteps = traj_x.shape[1]
+
+        # Wrap timestep to handle resample_frequency > episode_length
+        effective_timestep = timestep % num_timesteps
+
+        # Initialize output arrays
+        future_traj = np.zeros((num_agents, num_future_frames, 2), dtype=np.float32)
+        valid_mask = np.zeros((num_agents, num_future_frames), dtype=bool)
+
+        # Get current position and heading
+        curr_x = traj_x[:, effective_timestep]
+        curr_y = traj_y[:, effective_timestep]
+        curr_heading = traj_heading[:, effective_timestep]
+
+        # Precompute rotation (rotate by -heading to align with +x axis)
+        cos_h = np.cos(-curr_heading)
+        sin_h = np.sin(-curr_heading)
+
+        # Fill future trajectory
+        for t in range(num_future_frames):
+            future_t = effective_timestep + t + 1  # +1 because we want next timestep onwards
+            if future_t >= num_timesteps:
+                break
+
+            # Global positions
+            global_x = traj_x[:, future_t]
+            global_y = traj_y[:, future_t]
+
+            # Transform to local coordinates
+            dx = global_x - curr_x
+            dy = global_y - curr_y
+
+            # Rotate to local frame
+            local_x = cos_h * dx - sin_h * dy
+            local_y = sin_h * dx + cos_h * dy
+
+            future_traj[:, t, 0] = local_x
+            future_traj[:, t, 1] = local_y
+
+            # Validity: both current and future timesteps must be valid
+            valid_mask[:, t] = (traj_valid[:, effective_timestep] > 0) & (traj_valid[:, future_t] > 0)
+
+        return future_traj, valid_mask
 
 
 def calculate_area(p1, p2, p3):

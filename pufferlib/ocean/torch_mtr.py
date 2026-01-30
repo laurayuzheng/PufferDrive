@@ -196,9 +196,9 @@ class DriveMTR(nn.Module):
         partner_objects = partner_obs.view(-1, self.max_partner_objects, self.partner_features)
         road_objects = road_obs.view(-1, self.max_road_objects, self.road_features)
 
-        # One-hot encode road type
+        # One-hot encode road type (clamp to valid range, invalid segments may have negative values)
         road_continuous = road_objects[:, :, : self.road_features - 1]
-        road_categorical = road_objects[:, :, self.road_features - 1]
+        road_categorical = road_objects[:, :, self.road_features - 1].clamp(min=0, max=6)
         road_onehot = F.one_hot(road_categorical.long(), num_classes=7)
         road_objects = torch.cat([road_continuous, road_onehot], dim=2)
 
@@ -337,55 +337,94 @@ class DriveMTR(nn.Module):
         self,
         gt_future_traj: torch.Tensor,
         gt_valid_mask: torch.Tensor,
+        obj_speeds: Optional[torch.Tensor] = None,
+        obj_lengths: Optional[torch.Tensor] = None,
+        log_std_range: tuple = (-1.609, 5.0),
+        rho_limit: float = 0.5,
     ) -> torch.Tensor:
         """
         Compute GMM NLL loss on predicted trajectory vs ground truth.
 
+        Uses the bivariate Gaussian NLL loss from MTR (Shi et al., NeurIPS 2022).
+        Predicted actions are integrated via bicycle model to get position predictions
+        with uncertainty, then compared against ground truth positions.
+
         Args:
-            gt_future_traj: (batch, T, 2) ground truth positions
-            gt_valid_mask: (batch, T) validity mask
+            gt_future_traj: (batch, T, 2) ground truth positions (x, y) in local frame
+            gt_valid_mask: (batch, T) validity mask (1 = valid, 0 = invalid)
+            obj_speeds: (batch,) initial speeds for kinematic integration (default: 5.0 m/s)
+            obj_lengths: (batch,) vehicle lengths for bicycle model (default: 4.5m)
+            log_std_range: (min, max) clipping range for log standard deviations
+            rho_limit: clipping range for correlation coefficient
 
         Returns:
-            Trajectory loss scalar
+            Trajectory loss scalar (GMM NLL, lower is better)
         """
         if self._pred_trajs is None or self._pred_scores is None:
             return torch.tensor(0.0, device=gt_future_traj.device)
 
-        pred_trajs = self._pred_trajs  # (batch, K, T, 7)
+        pred_trajs = self._pred_trajs  # (batch, K, T, 7) - raw GMM action output
         pred_scores = self._pred_scores  # (batch, K)
         batch_size, K, T, _ = pred_trajs.shape
+        device = pred_trajs.device
+
+        # Default vehicle parameters if not provided
+        if obj_speeds is None:
+            obj_speeds = torch.full((batch_size,), 5.0, device=device)
+        if obj_lengths is None:
+            obj_lengths = torch.full((batch_size,), 4.5, device=device)
+
+        # Integrate actions to trajectory positions via bicycle model
+        # Output: (batch, K, T, 7) with [mu_x, mu_y, log_σ_x, log_σ_y, ρ, vel_x, vel_y]
+        pred_traj_pos = self.decoder.action_to_trajectory(
+            pred_trajs, obj_speeds, obj_lengths, delta_t=0.1
+        )
 
         # Truncate to match lengths
         T_gt = gt_future_traj.shape[1]
         T_min = min(T, T_gt)
-        pred_trajs = pred_trajs[:, :, :T_min, :]
+        pred_traj_pos = pred_traj_pos[:, :, :T_min, :]
         gt_future_traj = gt_future_traj[:, :T_min, :]
-        gt_valid_mask = gt_valid_mask[:, :T_min]
+        gt_valid_mask = gt_valid_mask[:, :T_min].float()
 
-        # Extract predicted positions (first 2 values after kinematic integration)
-        # Note: pred_trajs has raw GMM output, not integrated positions
-        # For simplicity, use the velocity components to approximate position delta
-        pred_pos = pred_trajs[:, :, :, :2]  # Raw output (not integrated)
+        # ========== Winner-Takes-All: Find nearest mode ==========
+        # Compute L2 distance to find which mode (query) is closest to GT
+        pred_pos = pred_traj_pos[:, :, :, :2]  # (batch, K, T, 2) - mu_x, mu_y
+        gt_expanded = gt_future_traj.unsqueeze(1)  # (batch, 1, T, 2)
+        distance = (pred_pos - gt_expanded).norm(dim=-1)  # (batch, K, T)
+        distance_masked = (distance * gt_valid_mask.unsqueeze(1)).sum(dim=-1)  # (batch, K)
+        nearest_mode_idxs = distance_masked.argmin(dim=-1)  # (batch,)
 
-        # Compute L2 distance between predictions and GT
-        # gt_future_traj: (batch, T, 2) -> (batch, 1, T, 2)
-        gt_expanded = gt_future_traj.unsqueeze(1)
+        # Select the nearest mode's predictions
+        batch_idxs = torch.arange(batch_size, device=device)
+        nearest_trajs = pred_traj_pos[batch_idxs, nearest_mode_idxs]  # (batch, T, 7)
 
-        # Distance: (batch, K, T)
-        dist = torch.norm(pred_pos - gt_expanded, dim=-1)
+        # ========== GMM NLL Loss (Bivariate Gaussian) ==========
+        # Following MTR loss_utils.py exactly for numerical stability
+        # Residuals: gt - pred
+        res_trajs = gt_future_traj - nearest_trajs[:, :, 0:2]  # (batch, T, 2)
+        dx = res_trajs[:, :, 0]
+        dy = res_trajs[:, :, 1]
 
-        # Apply validity mask
-        gt_valid_expanded = gt_valid_mask.unsqueeze(1)  # (batch, 1, T)
-        dist_masked = dist * gt_valid_expanded
+        # Extract and clamp uncertainty parameters
+        log_std1 = torch.clamp(nearest_trajs[:, :, 2], min=log_std_range[0], max=log_std_range[1])
+        log_std2 = torch.clamp(nearest_trajs[:, :, 3], min=log_std_range[0], max=log_std_range[1])
+        std1 = torch.exp(log_std1)
+        std2 = torch.exp(log_std2)
+        rho = torch.clamp(nearest_trajs[:, :, 4], min=-rho_limit, max=rho_limit)
 
-        # Sum over timesteps, average over batch
-        num_valid = gt_valid_mask.sum(dim=-1).clamp(min=1)  # (batch,)
-        ade_per_query = dist_masked.sum(dim=-1) / num_valid.unsqueeze(1)  # (batch, K)
+        # Bivariate Gaussian NLL (from MTR loss_utils.py:59-63)
+        # -log(a^-1 * e^b) = log(a) - b
+        reg_gmm_log_coefficient = log_std1 + log_std2 + 0.5 * torch.log(1 - rho ** 2 + EPS)
+        reg_gmm_exp = (0.5 / (1 - rho ** 2 + EPS)) * (
+            (dx ** 2) / (std1 ** 2) + (dy ** 2) / (std2 ** 2)
+            - 2 * rho * dx * dy / (std1 * std2)
+        )
 
-        # Winner-takes-all: use best query
-        min_ade = ade_per_query.min(dim=-1).values  # (batch,)
+        # Sum over valid timesteps, average over batch
+        reg_loss = ((reg_gmm_log_coefficient + reg_gmm_exp) * gt_valid_mask).sum(dim=-1)  # (batch,)
 
-        return min_ade.mean()
+        return reg_loss.mean()
 
 
 class DriveMTRMoE(nn.Module):
@@ -571,18 +610,70 @@ class DriveMTRMoE(nn.Module):
             return
 
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        # PufferLib checkpoints use 'state_dict', not 'model_state_dict'
+        state_dict = checkpoint.get('state_dict', checkpoint.get('model_state_dict', checkpoint))
 
-        # Filter for encoder and decoder weights
-        encoder_state = {k.replace('encoder.', ''): v for k, v in state_dict.items() if k.startswith('encoder.')}
+        # Remap old checkpoint keys to new naming convention
+        # Old: agent_polyline_pre_mlps -> New: agent_polyline_encoder.pre_mlps
+        key_mapping = {
+            'agent_polyline_pre_mlps': 'agent_polyline_encoder.pre_mlps',
+            'agent_polyline_mlps': 'agent_polyline_encoder.mlps',
+            'agent_polyline_out_mlps': 'agent_polyline_encoder.out_mlps',
+            'map_polyline_pre_mlps': 'map_polyline_encoder.pre_mlps',
+            'map_polyline_mlps': 'map_polyline_encoder.mlps',
+            'map_polyline_out_mlps': 'map_polyline_encoder.out_mlps',
+        }
+
+        def remap_key(key):
+            for old, new in key_mapping.items():
+                if old in key:
+                    return key.replace(old, new)
+            return key
+
+        # Filter for encoder and decoder weights, with key remapping
+        encoder_state = {}
+        for k, v in state_dict.items():
+            if k.startswith('encoder.'):
+                new_key = remap_key(k.replace('encoder.', ''))
+                encoder_state[new_key] = v
+
         decoder_state = {k.replace('decoder.', ''): v for k, v in state_dict.items() if k.startswith('decoder.')}
 
+        loaded_count = 0
         if encoder_state:
-            self.encoder.load_state_dict(encoder_state, strict=False)
-            print(f"Loaded encoder weights from {checkpoint_path}")
+            # Get model state dict for shape comparison
+            model_state = self.encoder.state_dict()
+            # Filter to only load weights with matching shapes
+            compatible_state = {}
+            for k, v in encoder_state.items():
+                if k in model_state and model_state[k].shape == v.shape:
+                    compatible_state[k] = v
+                elif k in model_state:
+                    print(f"  Skipping {k}: shape mismatch (ckpt {v.shape} vs model {model_state[k].shape})")
+
+            if compatible_state:
+                self.encoder.load_state_dict(compatible_state, strict=False)
+                loaded_count += len(compatible_state)
+                print(f"Loaded {len(compatible_state)}/{len(encoder_state)} encoder weights from {checkpoint_path}")
+
         if decoder_state:
-            self.decoder.load_state_dict(decoder_state, strict=False)
-            print(f"Loaded decoder weights from {checkpoint_path}")
+            model_state = self.decoder.state_dict()
+            compatible_state = {}
+            for k, v in decoder_state.items():
+                if k in model_state and model_state[k].shape == v.shape:
+                    compatible_state[k] = v
+                elif k in model_state:
+                    print(f"  Skipping {k}: shape mismatch (ckpt {v.shape} vs model {model_state[k].shape})")
+
+            if compatible_state:
+                self.decoder.load_state_dict(compatible_state, strict=False)
+                loaded_count += len(compatible_state)
+                print(f"Loaded {len(compatible_state)}/{len(decoder_state)} decoder weights from {checkpoint_path}")
+
+        if loaded_count == 0:
+            print(f"WARNING: No weights were loaded from {checkpoint_path}!")
+        else:
+            print(f"Total: Loaded {loaded_count} weights from base checkpoint")
 
     def forward(self, observations, state=None):
         hidden = self.encode_observations(observations, state)
@@ -614,9 +705,9 @@ class DriveMTRMoE(nn.Module):
         partner_objects = partner_obs.view(-1, self.max_partner_objects, self.partner_features)
         road_objects = road_obs.view(-1, self.max_road_objects, self.road_features)
 
-        # One-hot encode road type
+        # One-hot encode road type (clamp to valid range, invalid segments may have negative values)
         road_continuous = road_objects[:, :, : self.road_features - 1]
-        road_categorical = road_objects[:, :, self.road_features - 1]
+        road_categorical = road_objects[:, :, self.road_features - 1].clamp(min=0, max=6)
         road_onehot = F.one_hot(road_categorical.long(), num_classes=7)
         road_objects = torch.cat([road_continuous, road_onehot], dim=2)
 
@@ -703,24 +794,147 @@ class DriveMTRMoE(nn.Module):
         return hidden
 
     def decode_actions(self, flat_hidden, expert_probs=None):
-        """Decode hidden state to actions and value using LoRA experts."""
+        """
+        Decode hidden state to actions and value.
+
+        Uses the pretrained decoder's GMM predictions as the base, then applies
+        LoRA expert residuals based on routing probabilities.
+        """
         if expert_probs is None:
             expert_probs = self._expert_probs
 
+        pred_trajs = self._pred_trajs  # (batch, K, T, 7)
+        pred_scores = self._pred_scores  # (batch, K)
         batch_size = flat_hidden.shape[0]
 
-        if self.is_continuous:
-            parameters = self.actor(flat_hidden, expert_probs)
-            loc, scale = torch.split(parameters, self.atn_dim, dim=1)
-            std = F.softplus(scale) + 1e-4
-            action = torch.distributions.Normal(loc, std)
+        # Compute base action logits from decoder's GMM predictions (like DriveMTR)
+        if pred_trajs is not None and pred_scores is not None:
+            # Select best query based on confidence scores
+            if self.training:
+                weights = F.softmax(pred_scores, dim=-1)
+                first_step_raw = pred_trajs[:, :, 0, :2]
+                raw_actions = torch.einsum('bk,bka->ba', weights, first_step_raw)
+            else:
+                best_idx = pred_scores.argmax(dim=-1)
+                raw_actions = pred_trajs[torch.arange(batch_size, device=pred_trajs.device), best_idx, 0, :2]
+
+            # Apply transforms
+            accel = raw_actions[:, 0]
+            steer = torch.tanh(raw_actions[:, 1]) * (torch.pi / 3)
+            steer_normalized = steer / (torch.pi / 3)
+
+            if self.is_continuous:
+                base_loc = torch.stack([accel, steer_normalized], dim=-1)
+                # Apply LoRA residual
+                residual = self.actor(flat_hidden, expert_probs)
+                residual_loc, residual_scale = torch.split(residual, self.atn_dim, dim=1)
+                loc = base_loc + 0.1 * residual_loc  # Small residual
+                std = F.softplus(residual_scale) + 1e-4
+                action = torch.distributions.Normal(loc, std)
+            else:
+                # Compute base logits from GMM
+                NUM_ACCEL = len(self.accel_values)
+                NUM_STEER = len(self.steer_values)
+                NUM_ACTIONS = NUM_ACCEL * NUM_STEER
+
+                temperature = 0.5
+                accel_logits = -torch.abs(accel.unsqueeze(-1) - self.accel_values) / temperature
+                steer_logits = -torch.abs(steer_normalized.unsqueeze(-1) - self.steer_values) / temperature
+                combined_logits = accel_logits.unsqueeze(-1) + steer_logits.unsqueeze(-2)
+                base_logits = combined_logits.view(batch_size, NUM_ACTIONS)
+
+                # Apply LoRA residual (small modification based on expert routing)
+                residual_logits = self.actor(flat_hidden, expert_probs)
+                action_logits = base_logits + 0.1 * residual_logits
+
+                action = torch.split(action_logits, self.atn_dim, dim=1)
         else:
-            action_logits = self.actor(flat_hidden, expert_probs)
-            action = torch.split(action_logits, self.atn_dim, dim=1)
+            # Fallback if no predictions (shouldn't happen in normal use)
+            if self.is_continuous:
+                parameters = self.actor(flat_hidden, expert_probs)
+                loc, scale = torch.split(parameters, self.atn_dim, dim=1)
+                std = F.softplus(scale) + 1e-4
+                action = torch.distributions.Normal(loc, std)
+            else:
+                action_logits = self.actor(flat_hidden, expert_probs)
+                action = torch.split(action_logits, self.atn_dim, dim=1)
 
         value = self.value_fn(flat_hidden)
 
         return action, value
+
+    def get_trajectory_loss(
+        self,
+        gt_future_traj: torch.Tensor,
+        gt_valid_mask: torch.Tensor,
+        obj_speeds: Optional[torch.Tensor] = None,
+        obj_lengths: Optional[torch.Tensor] = None,
+        log_std_range: tuple = (-1.609, 5.0),
+        rho_limit: float = 0.5,
+    ) -> torch.Tensor:
+        """
+        Compute GMM NLL loss on predicted trajectory vs ground truth.
+
+        Same as DriveMTR.get_trajectory_loss - see that method for full documentation.
+        """
+        if self._pred_trajs is None or self._pred_scores is None:
+            return torch.tensor(0.0, device=gt_future_traj.device)
+
+        pred_trajs = self._pred_trajs
+        pred_scores = self._pred_scores
+        batch_size, K, T, _ = pred_trajs.shape
+        device = pred_trajs.device
+
+        if obj_speeds is None:
+            obj_speeds = torch.full((batch_size,), 5.0, device=device)
+        if obj_lengths is None:
+            obj_lengths = torch.full((batch_size,), 4.5, device=device)
+
+        pred_traj_pos = self.decoder.action_to_trajectory(
+            pred_trajs, obj_speeds, obj_lengths, delta_t=0.1
+        )
+
+        T_gt = gt_future_traj.shape[1]
+        T_min = min(T, T_gt)
+        pred_traj_pos = pred_traj_pos[:, :, :T_min, :]
+        gt_future_traj = gt_future_traj[:, :T_min, :]
+        gt_valid_mask = gt_valid_mask[:, :T_min].float()
+
+        # Winner-takes-all
+        pred_pos = pred_traj_pos[:, :, :, :2]
+        gt_expanded = gt_future_traj.unsqueeze(1)
+        distance = (pred_pos - gt_expanded).norm(dim=-1)
+        distance_masked = (distance * gt_valid_mask.unsqueeze(1)).sum(dim=-1)
+        nearest_mode_idxs = distance_masked.argmin(dim=-1)
+
+        batch_idxs = torch.arange(batch_size, device=device)
+        nearest_trajs = pred_traj_pos[batch_idxs, nearest_mode_idxs]
+
+        # GMM NLL - following MTR loss_utils.py exactly
+        # Residuals: gt - pred (note: original MTR does gt - pred, not pred - gt)
+        res_trajs = gt_future_traj - nearest_trajs[:, :, 0:2]  # (batch, T, 2)
+        dx = res_trajs[:, :, 0]
+        dy = res_trajs[:, :, 1]
+
+        # Extract and clamp uncertainty parameters
+        log_std1 = torch.clamp(nearest_trajs[:, :, 2], min=log_std_range[0], max=log_std_range[1])
+        log_std2 = torch.clamp(nearest_trajs[:, :, 3], min=log_std_range[0], max=log_std_range[1])
+        std1 = torch.exp(log_std1)
+        std2 = torch.exp(log_std2)
+        rho = torch.clamp(nearest_trajs[:, :, 4], min=-rho_limit, max=rho_limit)
+
+        # Bivariate Gaussian NLL (from MTR loss_utils.py:59-63)
+        # -log(a^-1 * e^b) = log(a) - b
+        reg_gmm_log_coefficient = log_std1 + log_std2 + 0.5 * torch.log(1 - rho ** 2 + EPS)
+        reg_gmm_exp = (0.5 / (1 - rho ** 2 + EPS)) * (
+            (dx ** 2) / (std1 ** 2) + (dy ** 2) / (std2 ** 2)
+            - 2 * rho * dx * dy / (std1 * std2)
+        )
+
+        # Sum over valid timesteps, average over batch
+        reg_loss = ((reg_gmm_log_coefficient + reg_gmm_exp) * gt_valid_mask).sum(dim=-1)  # (batch,)
+
+        return reg_loss.mean()
 
     def get_auxiliary_losses(self, config=None) -> Dict[str, torch.Tensor]:
         """

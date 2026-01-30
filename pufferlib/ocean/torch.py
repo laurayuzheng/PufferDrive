@@ -16,7 +16,7 @@ Recurrent = pufferlib.models.LSTMWrapper
 
 
 class Drive(nn.Module):
-    def __init__(self, env, input_size=128, hidden_size=128, **kwargs):
+    def __init__(self, env, input_size=128, hidden_size=128, predict_goal=False, goal_hidden_dim=64, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
         self.observation_size = env.single_observation_space.shape[0]
@@ -28,6 +28,10 @@ class Drive(nn.Module):
 
         # Determine ego dimension from environment's dynamics model
         self.ego_dim = 10 if env.dynamics_model == "jerk" else 7
+
+        # Goal prediction config
+        self.predict_goal = predict_goal
+        self._goal_predictions = None
 
         self.ego_encoder = nn.Sequential(
             pufferlib.pytorch.layer_init(nn.Linear(self.ego_dim, input_size)),
@@ -64,6 +68,14 @@ class Drive(nn.Module):
         self.actor = pufferlib.pytorch.layer_init(nn.Linear(hidden_size, sum(self.atn_dim)), std=0.01)
         self.value_fn = pufferlib.pytorch.layer_init(nn.Linear(hidden_size, 1), std=1)
 
+        # Goal prediction head (predicts goal in ego-centric frame)
+        if predict_goal:
+            self.goal_head = nn.Sequential(
+                pufferlib.pytorch.layer_init(nn.Linear(hidden_size, goal_hidden_dim)),
+                nn.ReLU(),
+                pufferlib.pytorch.layer_init(nn.Linear(goal_hidden_dim, 2), std=0.01),  # (x, y) in ego frame
+            )
+
     def forward(self, observations, state=None):
         hidden = self.encode_observations(observations)
         actions, value = self.decode_actions(hidden)
@@ -95,7 +107,11 @@ class Drive(nn.Module):
 
         # Pass through shared embedding
         embedding = F.relu(self.shared_embedding(concat_features))
-        # embedding = self.shared_embedding(concat_features)
+
+        # Compute goal predictions if enabled
+        if self.predict_goal:
+            self._goal_predictions = self.goal_head(embedding)
+
         return embedding
 
     def decode_actions(self, flat_hidden):
@@ -111,6 +127,38 @@ class Drive(nn.Module):
         value = self.value_fn(flat_hidden)
 
         return action, value
+
+    def get_goal_predictions(self):
+        """Return the most recent goal predictions.
+
+        Returns:
+            Tensor of shape (batch, 2) with predicted (x, y) in ego-centric frame,
+            or None if predict_goal is False.
+        """
+        return self._goal_predictions
+
+    def get_goal_prediction_loss(self, gt_goals, gt_valid):
+        """Compute MSE loss between predicted and logged goals.
+
+        Args:
+            gt_goals: Ground truth goals in ego-centric frame (meters), shape (batch, 2)
+            gt_valid: Boolean mask for valid goals, shape (batch,)
+
+        Returns:
+            Scalar MSE loss tensor, or 0 if no valid samples.
+        """
+        if self._goal_predictions is None or not self.predict_goal:
+            return torch.tensor(0.0, device=gt_goals.device)
+
+        valid_mask = gt_valid.bool()
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=gt_goals.device)
+
+        # Scale ground truth goals to match observation space (0.005 scale factor from drive.h)
+        # This makes predictions and targets in the same scale as the goal observations
+        gt_goals_scaled = gt_goals * 0.005
+
+        return F.mse_loss(self._goal_predictions[valid_mask], gt_goals_scaled[valid_mask])
 
 
 class DriveMoE(nn.Module):
@@ -138,6 +186,8 @@ class DriveMoE(nn.Module):
         expert_prior=None,
         use_social_forces_routing=False,
         social_forces_only=False,
+        predict_goal=False,
+        goal_hidden_dim=64,
         **kwargs,
     ):
         """
@@ -148,16 +198,21 @@ class DriveMoE(nn.Module):
             social_forces_only: If True (and use_social_forces_routing=True), use only
                 social forces for routing. If False, fuse social forces with encoded
                 context features.
+            predict_goal: If True, add a goal prediction head. The policy will predict
+                its own goal from context (road geometry, other agents).
+            goal_hidden_dim: Hidden dimension for goal prediction head.
         """
         super().__init__()
         from pufferlib.ocean.moe_adapters import (
             LoRAExpertsRL,
             PersonaRouter,
             SocialForcesRouter,
+            SocialForcesRouterWithReconstruction,
             kl_divergence_loss,
             entropy_loss,
             expert_cosine_loss,
             expert_output_diversity_loss,
+            reconstruction_loss,
             compute_temperature,
         )
 
@@ -179,6 +234,7 @@ class DriveMoE(nn.Module):
         self._entropy_loss = entropy_loss
         self._expert_cosine_loss = expert_cosine_loss
         self._expert_output_diversity_loss = expert_output_diversity_loss
+        self._reconstruction_loss = reconstruction_loss
         self._compute_temperature = compute_temperature
 
         # Expert prior for KL loss (e.g., [0.3, 0.6, 0.1] from open-loop)
@@ -218,8 +274,8 @@ class DriveMoE(nn.Module):
 
         # Router: predicts expert probabilities
         if use_social_forces_routing:
-            # Social forces router uses physics-based features for routing
-            self.router = SocialForcesRouter(
+            # Social forces router with VAE-style reconstruction (Polysona)
+            self.router = SocialForcesRouterWithReconstruction(
                 num_experts=num_experts,
                 hidden_dim=router_hidden_dim,
                 use_context_features=not social_forces_only,
@@ -254,6 +310,31 @@ class DriveMoE(nn.Module):
         # Value function (no experts - shared across all styles)
         self.value_fn = pufferlib.pytorch.layer_init(nn.Linear(hidden_size, 1), std=1)
 
+        # Goal prediction with LoRA experts
+        self.predict_goal = predict_goal
+        self._goal_predictions = None
+        self.goal_hidden_dim = goal_hidden_dim
+
+        if predict_goal:
+            # Base goal head (shared across experts)
+            self.goal_head_fc1 = pufferlib.pytorch.layer_init(nn.Linear(hidden_size, goal_hidden_dim))
+            self.goal_head_fc2 = pufferlib.pytorch.layer_init(nn.Linear(goal_hidden_dim, 2), std=0.01)
+
+            # LoRA adapters for goal prediction (experts predict different goals)
+            # A matrices: (num_experts, lora_rank, goal_hidden_dim)
+            # B matrices: (num_experts, 2, lora_rank)
+            self.goal_expert_A = nn.Parameter(
+                torch.zeros(num_experts, lora_rank, goal_hidden_dim)
+            )
+            self.goal_expert_B = nn.Parameter(
+                torch.zeros(num_experts, 2, lora_rank)
+            )
+            # Initialize A with small random values, B with zeros
+            nn.init.kaiming_uniform_(self.goal_expert_A, a=5**0.5)
+            nn.init.zeros_(self.goal_expert_B)
+            self.goal_lora_alpha = lora_alpha
+            self.goal_lora_rank = lora_rank
+
         # Freeze base model weights if specified (but NOT value_fn - it must adapt)
         if freeze_base:
             for param in self.ego_encoder.parameters():
@@ -270,6 +351,9 @@ class DriveMoE(nn.Module):
         self._aux_losses = {}
         self._expert_probs = None
         self._router_logits = None
+        # Reconstruction outputs (for VAE-style loss)
+        self._social_forces = None
+        self._reconstructed_social_forces = None
 
         # Expert usage tracking for logging
         self._expert_usage_counts = None
@@ -306,15 +390,20 @@ class DriveMoE(nn.Module):
 
         # Router prediction (before shared embedding for richer features)
         if self.use_social_forces_routing:
-            # Social forces router uses raw partner observations
-            expert_probs, router_logits = self.router(
+            # Social forces router with reconstruction (returns 4 values)
+            expert_probs, router_logits, social_forces, reconstructed_sf = self.router(
                 partner_obs=partner_objects,
                 context_features=concat_features if not self.social_forces_only else None,
                 hard=not self.training,
             )
+            # Store reconstruction outputs for VAE loss
+            self._social_forces = social_forces
+            self._reconstructed_social_forces = reconstructed_sf
         else:
-            # Standard router uses encoded features
+            # Standard router uses encoded features (returns 2 values)
             expert_probs, router_logits = self.router(concat_features, hard=not self.training)
+            self._social_forces = None
+            self._reconstructed_social_forces = None
 
         # Store for auxiliary losses
         self._expert_probs = expert_probs
@@ -330,8 +419,43 @@ class DriveMoE(nn.Module):
         # Shared embedding
         embedding = F.relu(self.shared_embedding(concat_features))
 
+        # Compute goal predictions with LoRA experts if enabled
+        if self.predict_goal:
+            # Base goal prediction
+            goal_hidden = F.relu(self.goal_head_fc1(embedding))
+            base_goal = self.goal_head_fc2(goal_hidden)
+
+            # Apply LoRA delta weighted by expert probabilities
+            # expert_probs: (batch, num_experts)
+            # goal_expert_A: (num_experts, lora_rank, goal_hidden_dim)
+            # goal_expert_B: (num_experts, 2, lora_rank)
+            # goal_hidden: (batch, goal_hidden_dim)
+
+            # Compute LoRA output for each expert
+            # goal_hidden @ A^T: (batch, goal_hidden_dim) @ (num_experts, goal_hidden_dim, lora_rank)^T
+            # = (batch, goal_hidden_dim) @ (num_experts, lora_rank, goal_hidden_dim)
+            # For each expert: (batch, goal_hidden_dim) @ (goal_hidden_dim, lora_rank) -> (batch, lora_rank)
+            # Combined: (batch, num_experts, lora_rank)
+            lora_intermediate = torch.einsum('bh,erh->ber', goal_hidden, self.goal_expert_A)
+            # lora_intermediate @ B^T: (batch, num_experts, lora_rank) @ (num_experts, 2, lora_rank)^T
+            # = (batch, num_experts, lora_rank) @ (num_experts, lora_rank, 2)
+            # -> (batch, num_experts, 2)
+            lora_outputs = torch.einsum('ber,eor->beo', lora_intermediate, self.goal_expert_B)
+
+            # Weight by expert probabilities and sum
+            # expert_probs: (batch, num_experts), lora_outputs: (batch, num_experts, 2)
+            lora_delta = torch.einsum('be,beo->bo', expert_probs, lora_outputs)
+
+            # Scale by alpha/rank
+            lora_delta = lora_delta * (self.goal_lora_alpha / self.goal_lora_rank)
+
+            self._goal_predictions = base_goal + lora_delta
+        else:
+            self._goal_predictions = None
+
         # Compute auxiliary losses during training (after embedding is ready for output_div loss)
         if self.training:
+            # expert_probs are soft (from softmax) during training, so use directly
             self._aux_losses = {
                 "kl": self._kl_divergence_loss(expert_probs, prior=self.expert_prior),
                 "entropy": self._entropy_loss(expert_probs),
@@ -341,6 +465,12 @@ class DriveMoE(nn.Module):
                 # Output diversity loss (gated by coefficient in pufferl.py)
                 # Set to None here - it will be computed lazily if coefficient > 0
                 "output_div": None,
+                # Reconstruction loss (VAE-style, from Polysona)
+                "reconstruction": (
+                    self._reconstruction_loss(self._reconstructed_social_forces, self._social_forces)
+                    if self._social_forces is not None
+                    else None
+                ),
             }
             # Store embedding for lazy output_div computation
             self._cached_embedding = embedding
@@ -404,6 +534,38 @@ class DriveMoE(nn.Module):
 
         return stats
 
+    def get_goal_predictions(self):
+        """Return the most recent goal predictions.
+
+        Returns:
+            Tensor of shape (batch, 2) with predicted (x, y) in ego-centric frame,
+            or None if predict_goal is False.
+        """
+        return self._goal_predictions
+
+    def get_goal_prediction_loss(self, gt_goals, gt_valid):
+        """Compute MSE loss between predicted and logged goals.
+
+        Args:
+            gt_goals: Ground truth goals in ego-centric frame (meters), shape (batch, 2)
+            gt_valid: Boolean mask for valid goals, shape (batch,)
+
+        Returns:
+            Scalar MSE loss tensor, or 0 if no valid samples.
+        """
+        if self._goal_predictions is None or not self.predict_goal:
+            return torch.tensor(0.0, device=gt_goals.device)
+
+        valid_mask = gt_valid.bool()
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=gt_goals.device)
+
+        # Scale ground truth goals to match observation space (0.005 scale factor from drive.h)
+        # This makes predictions and targets in the same scale as the goal observations
+        gt_goals_scaled = gt_goals * 0.005
+
+        return F.mse_loss(self._goal_predictions[valid_mask], gt_goals_scaled[valid_mask])
+
     def update_temperature(self, progress, config):
         """Update Gumbel-Softmax temperature based on training progress."""
         tau_max = config.get("moe_tau_max", 2.0)
@@ -435,3 +597,13 @@ class DriveMoE(nn.Module):
         actions, value = self.decode_actions(hidden, expert_probs=forced_probs)
 
         return actions, value
+
+    def get_expert_assignments(self):
+        """Return expert assignments (argmax of expert_probs) from the last forward pass.
+
+        Returns:
+            Tensor of shape (batch,) with expert indices, or None if not available.
+        """
+        if self._expert_probs is None:
+            return None
+        return self._expert_probs.argmax(dim=-1)

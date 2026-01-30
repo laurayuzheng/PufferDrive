@@ -173,7 +173,8 @@ class PersonaRouter(nn.Module):
             indices = logits.argmax(dim=-1)
             expert_probs = F.one_hot(indices, num_classes=self.num_experts).float()
         else:
-            expert_probs = F.softmax(logits, dim=-1)
+            # Temperature-scaled softmax (annealing from soft to sharp)
+            expert_probs = F.softmax(logits / self.temperature.item(), dim=-1)
 
         return expert_probs, logits
 
@@ -375,14 +376,209 @@ class SocialForcesRouter(nn.Module):
         self.temperature.fill_(temperature)
 
 
+class SocialForcesRouterWithReconstruction(nn.Module):
+    """Router with VAE-style reconstruction loss (from Polysona).
+
+    Like SocialForcesRouter but adds a reconstruction head that predicts
+    social forces from the expert probabilities. This creates a VAE-esque
+    bottleneck where the discrete expert assignment must capture enough
+    information about the social context to reconstruct it.
+
+    The reconstruction loss encourages the latent expert variable to be
+    meaningful and prevents degenerate solutions.
+
+    Args:
+        num_experts: Number of experts (K)
+        hidden_dim: Hidden layer dimension for classifier
+        dropout: Dropout probability
+        use_context_features: If True, also use encoded context features (fused mode)
+        context_dim: Dimension of context features (only used if use_context_features=True)
+        social_force_dim: Dimension of social force features (default 6)
+    """
+
+    def __init__(
+        self,
+        num_experts: int = 3,
+        hidden_dim: int = 64,
+        dropout: float = 0.2,
+        use_context_features: bool = False,
+        context_dim: int = 192,
+        social_force_dim: int = 6,
+    ) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        self.use_context_features = use_context_features
+        self.social_force_dim = social_force_dim
+
+        # Social force normalization
+        self.social_force_norm = nn.LayerNorm(social_force_dim)
+
+        # Determine input dimension for classifier
+        if use_context_features:
+            # Fused mode: combine social forces with context features
+            self.fusion = nn.Sequential(
+                nn.Linear(context_dim + social_force_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+            )
+            classifier_input_dim = hidden_dim
+        else:
+            # Social forces only mode
+            classifier_input_dim = social_force_dim
+
+        # Classifier: social forces -> expert logits
+        self.classifier = nn.Sequential(
+            nn.Linear(classifier_input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, num_experts),
+        )
+
+        # Reconstructor: expert_probs -> social forces (VAE decoder)
+        # This creates the bottleneck: expert assignment must capture social context
+        self.reconstructor = nn.Sequential(
+            nn.Linear(num_experts, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, social_force_dim),
+        )
+
+        # Temperature for Gumbel-Softmax
+        self.register_buffer("temperature", torch.tensor(1.0))
+
+    def compute_social_forces(
+        self,
+        partner_obs: Tensor,
+        A: float = 1.0,
+        B: float = 1.0,
+        D: float = 5.0,
+        eps: float = 1e-6,
+    ) -> Tensor:
+        """Compute social force features from partner observations.
+
+        Same as SocialForcesRouter.compute_social_forces().
+        """
+        # Extract relative positions (undo the 0.02 scaling to get actual distances)
+        rel_x = partner_obs[:, :, 0] * 50.0  # Undo scaling: 1/0.02 = 50
+        rel_y = partner_obs[:, :, 1] * 50.0
+
+        # Compute distances
+        dist = torch.sqrt(rel_x**2 + rel_y**2 + eps)
+
+        # Create mask for valid partners (non-zero observations)
+        partner_magnitude = partner_obs.abs().sum(dim=-1)
+        valid_mask = (partner_magnitude > eps).float()
+
+        # Compute unit direction vectors (pointing away from neighbor = repulsive)
+        dir_x = -rel_x / (dist + eps)
+        dir_y = -rel_y / (dist + eps)
+
+        # Social force magnitude: A * exp((D - dist) / B)
+        force_magnitude = A * torch.exp(torch.clamp((D - dist) / B, max=10.0))
+        force_magnitude = force_magnitude * valid_mask
+
+        # Compute force vectors
+        force_x = force_magnitude * dir_x
+        force_y = force_magnitude * dir_y
+
+        # Sum forces over all partners
+        sum_force_x = force_x.sum(dim=-1)
+        sum_force_y = force_y.sum(dim=-1)
+
+        # Aggregate statistics
+        num_valid = valid_mask.sum(dim=-1).clamp(min=1)
+        mean_mag = force_magnitude.sum(dim=-1) / num_valid
+        max_mag = force_magnitude.max(dim=-1).values
+
+        # Std computation
+        mean_mag_expanded = mean_mag.unsqueeze(-1)
+        sq_diff = (force_magnitude - mean_mag_expanded * valid_mask) ** 2 * valid_mask
+        var_mag = sq_diff.sum(dim=-1) / num_valid.clamp(min=1)
+        std_mag = torch.sqrt(var_mag + eps)
+
+        # Normalized neighbor count
+        max_partners = partner_obs.shape[1]
+        norm_num_neighbors = num_valid / max_partners
+
+        # Concatenate all features
+        social_forces = torch.stack(
+            [sum_force_x, sum_force_y, mean_mag, max_mag, std_mag, norm_num_neighbors],
+            dim=-1,
+        )
+
+        return social_forces
+
+    def forward(
+        self,
+        partner_obs: Tensor,
+        context_features: Optional[Tensor] = None,
+        hard: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Forward pass with Gumbel-Softmax sampling and reconstruction.
+
+        Uses Gumbel-Softmax (Jang et al., 2016) for differentiable discrete sampling,
+        matching the original Polysona implementation. This creates a true VAE-style
+        bottleneck where the categorical latent must capture social context.
+
+        Args:
+            partner_obs: Raw partner observations (batch, max_partners, 7)
+            context_features: Optional encoded context features (batch, context_dim)
+            hard: If True, use hard (one-hot) routing (inference mode)
+
+        Returns:
+            Tuple of (expert_probs, logits, social_forces, reconstructed_social_forces)
+            - expert_probs: Gumbel-Softmax sampled (training) or one-hot (inference)
+            - logits: Raw router logits for auxiliary losses
+            - social_forces: Normalized social force features (reconstruction target)
+            - reconstructed_social_forces: Reconstructed from sampled latent
+        """
+        # Compute social force features
+        social_forces = self.compute_social_forces(partner_obs)
+        social_forces_normed = self.social_force_norm(social_forces)
+
+        # Build input for classifier
+        if self.use_context_features:
+            if context_features is None:
+                raise ValueError("context_features required when use_context_features=True")
+            fused = self.fusion(torch.cat([context_features, social_forces_normed], dim=-1))
+            input_features = fused
+        else:
+            input_features = social_forces_normed
+
+        # Classify to get expert logits
+        logits = self.classifier(input_features)
+
+        # Compute expert probabilities
+        if hard:
+            # Inference: deterministic argmax selection
+            indices = logits.argmax(dim=-1)
+            expert_probs = F.one_hot(indices, num_classes=self.num_experts).float()
+        else:
+            # Training: soft routing via softmax (no Gumbel noise)
+            # This ensures train/eval consistency - the same logits produce the same routing
+            expert_probs = F.softmax(logits / self.temperature.item(), dim=-1)
+
+        # Reconstruct social forces from expert probabilities (VAE decoder)
+        # This is the key VAE bottleneck: expert assignment must encode social context
+        reconstructed_sf = self.reconstructor(expert_probs)
+
+        return expert_probs, logits, social_forces_normed, reconstructed_sf
+
+    def set_temperature(self, temperature: float):
+        """Update Gumbel-Softmax temperature."""
+        self.temperature.fill_(temperature)
+
+
 def kl_divergence_loss(
     persona_probs: Tensor, prior: Optional[Tensor] = None
 ) -> Tensor:
     """
-    KL divergence loss to encourage uniform expert usage.
+    KL divergence loss to encourage expert usage matching the prior.
 
     Computes KL(empirical || prior) where empirical is the batch-average
-    expert assignment distribution.
+    expert assignment distribution. This penalizes the empirical distribution
+    for deviating from the prior (mode-seeking behavior).
 
     Args:
         persona_probs: Expert assignment probabilities (batch, num_experts)
@@ -400,29 +596,32 @@ def kl_divergence_loss(
     empirical = persona_probs.mean(dim=0) + EPS
     empirical = empirical / empirical.sum()  # Normalize
 
-    # KL divergence: sum(empirical * log(empirical / prior))
-    return F.kl_div(empirical.log(), prior, reduction="sum")
+    # KL(empirical || prior) = sum(empirical * log(empirical / prior))
+    # F.kl_div expects (log_input, target) and computes target * (log(target) - log_input)
+    # So we pass (prior.log(), empirical) to get KL(empirical || prior)
+    prior = prior + EPS  # Avoid log(0)
+    return F.kl_div(prior.log(), empirical, reduction="sum")
 
 
 def entropy_loss(persona_probs: Tensor) -> Tensor:
     """
-    Negative entropy loss to encourage sharp (confident) routing.
+    Entropy loss to encourage sharp (confident) routing.
 
     Lower entropy means more confident predictions (closer to one-hot).
-    We return negative entropy so that minimizing this loss increases sharpness.
+    Minimizing this loss (positive entropy) encourages sharper routing decisions.
 
     Args:
         persona_probs: Expert assignment probabilities (batch, num_experts)
 
     Returns:
-        Negative entropy scalar (mean over batch)
+        Mean entropy scalar (positive value)
     """
     # Add small epsilon for numerical stability
     probs = persona_probs + EPS
     # Entropy: -sum(p * log(p))
     entropy = -(probs * probs.log()).sum(dim=-1)
-    # Return negative entropy (we want to minimize this to get sharp predictions)
-    return -entropy.mean()
+    # Return positive entropy - minimizing this encourages sharp predictions
+    return entropy.mean()
 
 
 def expert_cosine_loss(expert_A: Tensor, expert_B: Tensor) -> Tensor:
@@ -578,3 +777,197 @@ def expert_output_diversity_loss(
         return -total_kl / num_pairs
     else:
         return torch.tensor(0.0, device=x.device)
+
+
+class DIAYNDiscriminator(nn.Module):
+    """DIAYN-style discriminator for expert diversity.
+
+    Predicts which expert (skill) generated a trajectory, enabling
+    diversity reward computation: r_div = log q(z|τ) - log p(z).
+
+    The discriminator is trained with cross-entropy to classify trajectories
+    by expert, and the policy receives intrinsic reward for being distinguishable.
+
+    Args:
+        state_dim: Dimension of state/observation features
+        action_dim: Dimension of action features
+        num_experts: Number of experts (K) to classify
+        trajectory_window: Number of timesteps in trajectory window
+        hidden_dim: Hidden layer dimension
+        use_conv: Whether to use 1D convolution (True) or MLP (False)
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        num_experts: int = 3,
+        trajectory_window: int = 16,
+        hidden_dim: int = 128,
+        use_conv: bool = False,
+    ) -> None:
+        super().__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.num_experts = num_experts
+        self.trajectory_window = trajectory_window
+        self.hidden_dim = hidden_dim
+        self.use_conv = use_conv
+
+        # Input: [s_{t-k}, a_{t-k}, ..., s_t, a_t] flattened
+        input_dim = trajectory_window * (state_dim + action_dim)
+
+        if use_conv:
+            # 1D Conv architecture for temporal patterns
+            self.encoder = nn.Sequential(
+                nn.Conv1d(state_dim + action_dim, hidden_dim, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),  # Pool over time
+                nn.Flatten(),
+            )
+            self.classifier = nn.Linear(hidden_dim, num_experts)
+        else:
+            # MLP architecture
+            self.encoder = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+            )
+            self.classifier = nn.Linear(hidden_dim, num_experts)
+
+    def forward(self, trajectory: Tensor) -> Tensor:
+        """Predict expert logits from trajectory.
+
+        Args:
+            trajectory: Trajectory window of shape:
+                - If use_conv: (batch, trajectory_window, state_dim + action_dim)
+                - If MLP: (batch, trajectory_window * (state_dim + action_dim))
+
+        Returns:
+            logits: Expert classification logits (batch, num_experts)
+        """
+        if self.use_conv:
+            # (batch, window, features) -> (batch, features, window)
+            x = trajectory.transpose(1, 2)
+            features = self.encoder(x)
+        else:
+            # Flatten trajectory if not already
+            if trajectory.dim() == 3:
+                trajectory = trajectory.reshape(trajectory.shape[0], -1)
+            features = self.encoder(trajectory)
+
+        logits = self.classifier(features)
+        return logits
+
+    def compute_diversity_reward(
+        self,
+        trajectory: Tensor,
+        expert_indices: Tensor,
+        prior: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Compute DIAYN diversity reward: r_div = log q(z|τ) - log p(z).
+
+        Args:
+            trajectory: Trajectory window (batch, window, features) or (batch, window * features)
+            expert_indices: Expert indices that generated the trajectory (batch,)
+            prior: Prior distribution over experts. If None, uses uniform.
+
+        Returns:
+            diversity_reward: Per-sample diversity reward (batch,)
+        """
+        with torch.no_grad():
+            # Get discriminator predictions
+            logits = self.forward(trajectory)
+            log_q_z = F.log_softmax(logits, dim=-1)  # (batch, num_experts)
+
+            # log q(z|τ) for the actual expert that generated the trajectory
+            log_q_z_given_tau = log_q_z.gather(
+                1, expert_indices.unsqueeze(-1).long()
+            ).squeeze(-1)  # (batch,)
+
+            # log p(z) - prior probability
+            if prior is None:
+                log_p_z = -math.log(self.num_experts)  # Uniform prior
+            else:
+                log_p_z = torch.log(prior[expert_indices] + EPS)
+
+            # DIAYN diversity reward
+            diversity_reward = log_q_z_given_tau - log_p_z
+
+        return diversity_reward
+
+    def compute_discriminator_loss(
+        self,
+        trajectory: Tensor,
+        expert_indices: Tensor,
+    ) -> Tensor:
+        """Compute cross-entropy loss for discriminator training.
+
+        Args:
+            trajectory: Trajectory window (batch, window, features) or (batch, window * features)
+            expert_indices: Ground truth expert indices (batch,)
+
+        Returns:
+            loss: Cross-entropy loss scalar
+        """
+        logits = self.forward(trajectory)
+        return F.cross_entropy(logits, expert_indices.long())
+
+    def compute_accuracy(
+        self,
+        trajectory: Tensor,
+        expert_indices: Tensor,
+    ) -> float:
+        """Compute discriminator classification accuracy.
+
+        Args:
+            trajectory: Trajectory window
+            expert_indices: Ground truth expert indices
+
+        Returns:
+            accuracy: Classification accuracy in [0, 1]
+        """
+        with torch.no_grad():
+            logits = self.forward(trajectory)
+            predictions = logits.argmax(dim=-1)
+            accuracy = (predictions == expert_indices.long()).float().mean().item()
+        return accuracy
+
+
+def create_diayn_discriminator(
+    obs_shape: tuple,
+    action_dim: int,
+    num_experts: int = 3,
+    trajectory_window: int = 16,
+    hidden_dim: int = 128,
+    use_conv: bool = False,
+) -> DIAYNDiscriminator:
+    """Factory function to create DIAYN discriminator.
+
+    Args:
+        obs_shape: Observation space shape (used to determine state_dim)
+        action_dim: Total action dimension
+        num_experts: Number of experts
+        trajectory_window: Number of timesteps in trajectory window
+        hidden_dim: Hidden layer dimension
+        use_conv: Whether to use 1D convolution
+
+    Returns:
+        DIAYNDiscriminator instance
+    """
+    import numpy as np
+    state_dim = int(np.prod(obs_shape))
+
+    return DIAYNDiscriminator(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        num_experts=num_experts,
+        trajectory_window=trajectory_window,
+        hidden_dim=hidden_dim,
+        use_conv=use_conv,
+    )

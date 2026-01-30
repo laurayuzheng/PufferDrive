@@ -187,6 +187,8 @@ struct Entity {
     float goal_position_z;
     float init_goal_x;
     float init_goal_y;
+    float predicted_goal_x;  // Policy's predicted goal in world coordinates
+    float predicted_goal_y;  // Used for reward when predict_goal=1
     int mark_as_expert;
     int collision_state;
     float metrics_array[5]; // metrics_array: [collision, offroad, reached_goal, lane_aligned
@@ -329,6 +331,7 @@ struct Drive {
     int *tracks_to_predict_indices;
     int init_mode;
     int control_mode;
+    int predict_goal; // If 1, zero out goal in observations (policy predicts its own goal)
 };
 
 void add_log(Drive *env) {
@@ -1680,6 +1683,77 @@ void c_get_global_agent_state(Drive *env, float *x_out, float *y_out, float *z_o
     }
 }
 
+// Get current agent positions in local (mean-centered) coordinates
+void c_get_agent_positions(Drive *env, float *x_out, float *y_out, float *heading_out) {
+    for (int i = 0; i < env->active_agent_count; i++) {
+        int agent_idx = env->active_agent_indices[i];
+        Entity *agent = &env->entities[agent_idx];
+        x_out[i] = agent->x;
+        y_out[i] = agent->y;
+        heading_out[i] = agent->heading;
+    }
+}
+
+// Get logged trajectory endpoints (init_goal) in ego-centric coordinates
+void c_get_logged_goals_ego_frame(Drive *env, float *goal_x_out, float *goal_y_out, int *valid_out) {
+    for (int i = 0; i < env->active_agent_count; i++) {
+        int agent_idx = env->active_agent_indices[i];
+        Entity *agent = &env->entities[agent_idx];
+
+        // Get goal in global coordinates (init_goal is the logged trajectory endpoint)
+        float goal_x = agent->init_goal_x;
+        float goal_y = agent->init_goal_y;
+
+        // Transform to ego-centric frame
+        float dx = goal_x - agent->x;
+        float dy = goal_y - agent->y;
+
+        // Rotate to ego vehicle's heading
+        float cos_h = agent->heading_x;
+        float sin_h = agent->heading_y;
+        float rel_goal_x = dx * cos_h + dy * sin_h;
+        float rel_goal_y = -dx * sin_h + dy * cos_h;
+
+        goal_x_out[i] = rel_goal_x;
+        goal_y_out[i] = rel_goal_y;
+
+        // Goal is valid if agent has valid trajectory data
+        valid_out[i] = (agent->traj_valid != NULL && agent->array_size > 0) ? 1 : 0;
+    }
+}
+
+void c_set_predicted_goals(Drive *env, float *pred_goal_x, float *pred_goal_y) {
+    // Set predicted goals from policy output
+    // Input: predictions in ego-centric scaled coordinates (scaled by 0.005)
+    // Output: stores in world coordinates in entity->predicted_goal_x/y
+
+    const float GOAL_SCALE = 200.0f;  // Inverse of 0.005 observation scaling
+
+    for (int i = 0; i < env->active_agent_count; i++) {
+        int agent_idx = env->active_agent_indices[i];
+        Entity *agent = &env->entities[agent_idx];
+
+        // Unscale from observation space to meters
+        float local_goal_x = pred_goal_x[i] * GOAL_SCALE;
+        float local_goal_y = pred_goal_y[i] * GOAL_SCALE;
+
+        // Transform from ego-centric to world coordinates
+        float cos_h = agent->heading_x;
+        float sin_h = agent->heading_y;
+
+        // Inverse of the ego-centric transform in c_get_logged_goals_ego_frame
+        // local_x = dx * cos_h + dy * sin_h
+        // local_y = -dx * sin_h + dy * cos_h
+        // Inverse: dx = local_x * cos_h - local_y * sin_h
+        //          dy = local_x * sin_h + local_y * cos_h
+        float dx = local_goal_x * cos_h - local_goal_y * sin_h;
+        float dy = local_goal_x * sin_h + local_goal_y * cos_h;
+
+        agent->predicted_goal_x = agent->x + dx;
+        agent->predicted_goal_y = agent->y + dy;
+    }
+}
+
 void c_get_global_ground_truth_trajectories(Drive *env, float *x_out, float *y_out, float *z_out, float *heading_out,
                                             int *valid_out, int *id_out, int *scenario_id_out) {
     for (int i = 0; i < env->active_agent_count; i++) {
@@ -1812,8 +1886,14 @@ void compute_observations(Drive *env) {
         float rel_goal_x = goal_x * cos_heading + goal_y * sin_heading;
         float rel_goal_y = -goal_x * sin_heading + goal_y * cos_heading;
 
-        obs[0] = rel_goal_x * 0.005f;
-        obs[1] = rel_goal_y * 0.005f;
+        // If predict_goal is enabled, zero out goal observations (policy will predict its own goal)
+        if (env->predict_goal) {
+            obs[0] = 0.0f;
+            obs[1] = 0.0f;
+        } else {
+            obs[0] = rel_goal_x * 0.005f;
+            obs[1] = rel_goal_y * 0.005f;
+        }
         obs[2] = signed_speed / MAX_SPEED;
         obs[3] = ego_entity->width / MAX_VEH_WIDTH;
         obs[4] = ego_entity->length / MAX_VEH_LEN;
@@ -2133,9 +2213,18 @@ void c_step(Drive *env) {
             env->entities[agent_idx].collided_before_goal = 1;
         }
 
+        // Use predicted goal if predict_goal is enabled, otherwise use logged goal
+        float goal_x, goal_y;
+        if (env->predict_goal) {
+            goal_x = env->entities[agent_idx].predicted_goal_x;
+            goal_y = env->entities[agent_idx].predicted_goal_y;
+        } else {
+            goal_x = env->entities[agent_idx].goal_position_x;
+            goal_y = env->entities[agent_idx].goal_position_y;
+        }
+
         float distance_to_goal =
-            relative_distance_2d(env->entities[agent_idx].x, env->entities[agent_idx].y,
-                                 env->entities[agent_idx].goal_position_x, env->entities[agent_idx].goal_position_y);
+            relative_distance_2d(env->entities[agent_idx].x, env->entities[agent_idx].y, goal_x, goal_y);
 
         float current_speed = sqrtf(env->entities[agent_idx].vx * env->entities[agent_idx].vx +
                                     env->entities[agent_idx].vy * env->entities[agent_idx].vy);

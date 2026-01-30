@@ -726,6 +726,111 @@ static PyObject *vec_get_global_agent_state(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+// Get agent positions in local coordinates
+static PyObject *vec_get_agent_positions(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 4) {
+        PyErr_SetString(PyExc_TypeError, "vec_get_agent_positions requires 4 arguments");
+        return NULL;
+    }
+
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) {
+        return NULL;
+    }
+
+    // Get the numpy arrays from arguments
+    PyObject *x_arr = PyTuple_GetItem(args, 1);
+    PyObject *y_arr = PyTuple_GetItem(args, 2);
+    PyObject *heading_arr = PyTuple_GetItem(args, 3);
+
+    if (!PyArray_Check(x_arr) || !PyArray_Check(y_arr) || !PyArray_Check(heading_arr)) {
+        PyErr_SetString(PyExc_TypeError, "All output arrays must be NumPy arrays");
+        return NULL;
+    }
+
+    float *x_base = (float *)PyArray_DATA((PyArrayObject *)x_arr);
+    float *y_base = (float *)PyArray_DATA((PyArrayObject *)y_arr);
+    float *heading_base = (float *)PyArray_DATA((PyArrayObject *)heading_arr);
+
+    int offset = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        c_get_agent_positions(drive, &x_base[offset], &y_base[offset], &heading_base[offset]);
+        offset += drive->active_agent_count;
+    }
+
+    Py_RETURN_NONE;
+}
+
+// Get logged goals in ego-centric frame
+static PyObject *vec_get_logged_goals_ego_frame(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 4) {
+        PyErr_SetString(PyExc_TypeError, "vec_get_logged_goals_ego_frame requires 4 arguments");
+        return NULL;
+    }
+
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) {
+        return NULL;
+    }
+
+    // Get the numpy arrays from arguments
+    PyObject *goal_x_arr = PyTuple_GetItem(args, 1);
+    PyObject *goal_y_arr = PyTuple_GetItem(args, 2);
+    PyObject *valid_arr = PyTuple_GetItem(args, 3);
+
+    if (!PyArray_Check(goal_x_arr) || !PyArray_Check(goal_y_arr) || !PyArray_Check(valid_arr)) {
+        PyErr_SetString(PyExc_TypeError, "All output arrays must be NumPy arrays");
+        return NULL;
+    }
+
+    float *goal_x_base = (float *)PyArray_DATA((PyArrayObject *)goal_x_arr);
+    float *goal_y_base = (float *)PyArray_DATA((PyArrayObject *)goal_y_arr);
+    int *valid_base = (int *)PyArray_DATA((PyArrayObject *)valid_arr);
+
+    int offset = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        c_get_logged_goals_ego_frame(drive, &goal_x_base[offset], &goal_y_base[offset], &valid_base[offset]);
+        offset += drive->active_agent_count;
+    }
+
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_set_predicted_goals(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 3) {
+        PyErr_SetString(PyExc_TypeError, "vec_set_predicted_goals requires 3 arguments");
+        return NULL;
+    }
+
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) {
+        return NULL;
+    }
+
+    // Get the numpy arrays from arguments (predicted goals in ego-centric scaled coordinates)
+    PyObject *goal_x_arr = PyTuple_GetItem(args, 1);
+    PyObject *goal_y_arr = PyTuple_GetItem(args, 2);
+
+    if (!PyArray_Check(goal_x_arr) || !PyArray_Check(goal_y_arr)) {
+        PyErr_SetString(PyExc_TypeError, "All input arrays must be NumPy arrays");
+        return NULL;
+    }
+
+    float *goal_x_base = (float *)PyArray_DATA((PyArrayObject *)goal_x_arr);
+    float *goal_y_base = (float *)PyArray_DATA((PyArrayObject *)goal_y_arr);
+
+    int offset = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        c_set_predicted_goals(drive, &goal_x_base[offset], &goal_y_base[offset]);
+        offset += drive->active_agent_count;
+    }
+
+    Py_RETURN_NONE;
+}
+
 static PyObject *get_ground_truth_trajectories(PyObject *self, PyObject *args) {
     if (PyTuple_Size(args) != 7) {
         PyErr_SetString(PyExc_TypeError, "get_ground_truth_trajectories requires 7 arguments");
@@ -1073,6 +1178,11 @@ static PyMethodDef methods[] = {
     {"shared", (PyCFunction)my_shared, METH_VARARGS | METH_KEYWORDS, "Shared state"},
     {"get_global_agent_state", get_global_agent_state, METH_VARARGS, "Get global agent state"},
     {"vec_get_global_agent_state", vec_get_global_agent_state, METH_VARARGS, "Get agent state from vectorized env"},
+    {"vec_get_agent_positions", vec_get_agent_positions, METH_VARARGS, "Get agent positions in local coordinates"},
+    {"vec_get_logged_goals_ego_frame", vec_get_logged_goals_ego_frame, METH_VARARGS,
+     "Get logged trajectory endpoints in ego-centric frame"},
+    {"vec_set_predicted_goals", vec_set_predicted_goals, METH_VARARGS,
+     "Set predicted goals from policy output (in ego-centric scaled coordinates)"},
     {"get_ground_truth_trajectories", get_ground_truth_trajectories, METH_VARARGS, "Get ground truth trajectories"},
     {"vec_get_global_ground_truth_trajectories", vec_get_global_ground_truth_trajectories, METH_VARARGS,
      "Get ground truth trajectories from vectorized env"},

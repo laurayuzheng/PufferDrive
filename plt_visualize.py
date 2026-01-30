@@ -629,7 +629,7 @@ def run_rollout_with_forced_expert(env, policy, expert_idx, num_steps, has_lstm=
 
             # Get action from logits using sampling (like evaluation) instead of argmax
             import pufferlib.pytorch
-            action, _, _ = pufferlib.pytorch.sample_logits()
+            action, _, _ = pufferlib.pytorch.sample_logits(actions_tuple)
             action = action.numpy()
             if action.ndim == 1:
                 action = action[:, np.newaxis]
@@ -939,6 +939,82 @@ def visualize_expert_distribution(args):
     print(f"Saved expert distribution plot to {args.output}")
 
 
+def visualize_multiverse_batch(args, start_scenario, end_scenario):
+    """Generate multiverse visualizations for multiple scenarios.
+
+    Args:
+        args: Parsed arguments
+        start_scenario: First scenario index (inclusive)
+        end_scenario: Last scenario index (inclusive)
+    """
+    from pathlib import Path
+
+    # Determine output directory and extension
+    output_dir = Path("viz_output/multiverse")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine output extension from args.output or default to .gif
+    if args.output.endswith(".mp4"):
+        ext = ".mp4"
+    elif args.output.endswith(".png"):
+        ext = ".png"
+    else:
+        ext = ".gif"
+
+    print(f"\n{'='*60}")
+    print(f"BATCH MULTIVERSE VISUALIZATION")
+    print(f"Scenarios: {start_scenario} to {end_scenario}")
+    print(f"Output directory: {output_dir}")
+    print(f"Output format: {ext}")
+    print(f"{'='*60}\n")
+
+    # Track results
+    successful = []
+    failed = []
+    skipped = []
+
+    for scenario_idx in range(start_scenario, end_scenario + 1):
+        output_path = output_dir / f"scenario_{scenario_idx:03d}{ext}"
+
+        # Check if map file exists
+        map_file = Path(args.map_dir) / f"map_{scenario_idx:03d}.bin"
+        if not map_file.exists():
+            print(f"[{scenario_idx:03d}] SKIP - Map file not found: {map_file}")
+            skipped.append(scenario_idx)
+            continue
+
+        print(f"\n[{scenario_idx:03d}] Processing scenario {scenario_idx}...")
+
+        # Create a copy of args with the specific scenario and output
+        import copy
+        scenario_args = copy.copy(args)
+        scenario_args.scenario = scenario_idx
+        scenario_args.output = str(output_path)
+
+        try:
+            visualize_multiverse(scenario_args)
+            successful.append(scenario_idx)
+            print(f"[{scenario_idx:03d}] SUCCESS - Saved to {output_path}")
+        except Exception as e:
+            failed.append((scenario_idx, str(e)))
+            print(f"[{scenario_idx:03d}] FAILED - {e}")
+
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"BATCH COMPLETE")
+    print(f"{'='*60}")
+    print(f"Successful: {len(successful)}")
+    print(f"Failed: {len(failed)}")
+    print(f"Skipped (no map file): {len(skipped)}")
+
+    if failed:
+        print(f"\nFailed scenarios:")
+        for scenario_idx, error in failed:
+            print(f"  [{scenario_idx:03d}] {error[:80]}...")
+
+    print(f"\nOutput directory: {output_dir}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="PufferDrive Matplotlib Visualization",
@@ -996,6 +1072,9 @@ def main():
                         help="Random seed for reproducibility")
     parser.add_argument("--scenario", type=int, default=None,
                         help="Specific scenario/map index to load (0-based). Overrides --num-maps to 1.")
+    parser.add_argument("--batch-scenarios", type=str, default=None,
+                        help="Generate visualizations for multiple scenarios. Format: 'START-END' (e.g., '0-100'). "
+                             "Output files are saved to viz_output/multiverse/scenario_XXX.gif")
     parser.add_argument("--config", type=str, default=None,
                         help="Config name or path (e.g., 'puffer_drive_moe' or full path to .ini). "
                              "Uses config values for env and policy parameters.")
@@ -1010,6 +1089,28 @@ def main():
             parser.error(str(e))
     else:
         args._config = None
+
+    # Handle batch scenarios mode
+    if args.batch_scenarios:
+        # Parse range format "START-END"
+        try:
+            parts = args.batch_scenarios.split("-")
+            if len(parts) == 2:
+                start_scenario = int(parts[0])
+                end_scenario = int(parts[1])
+            else:
+                parser.error(f"Invalid --batch-scenarios format. Use 'START-END' (e.g., '0-100')")
+        except ValueError:
+            parser.error(f"Invalid --batch-scenarios format. Use 'START-END' (e.g., '0-100')")
+
+        if start_scenario > end_scenario:
+            parser.error(f"Start scenario ({start_scenario}) must be <= end scenario ({end_scenario})")
+
+        # Force multiverse mode for batch
+        args.mode = "multiverse"
+        print(f"Using config: {args.config}")
+        visualize_multiverse_batch(args, start_scenario, end_scenario)
+        return
 
     # Auto-detect mode from output
     if args.mode == "auto":

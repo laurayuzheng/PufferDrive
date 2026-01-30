@@ -212,6 +212,25 @@ class LSTMWrapper(nn.Module):
         if hasattr(self.policy, "update_temperature"):
             self.policy.update_temperature(progress, config)
 
+    def get_goal_predictions(self):
+        """Passthrough to wrapped policy for goal predictions."""
+        if hasattr(self.policy, "get_goal_predictions"):
+            return self.policy.get_goal_predictions()
+        return None
+
+    def get_goal_prediction_loss(self, gt_goals, gt_valid):
+        """Passthrough to wrapped policy for goal prediction loss."""
+        if hasattr(self.policy, "get_goal_prediction_loss"):
+            return self.policy.get_goal_prediction_loss(gt_goals, gt_valid)
+        import torch
+        return torch.tensor(0.0, device=gt_goals.device)
+
+    def get_expert_assignments(self):
+        """Passthrough to wrapped policy for DIAYN expert assignments."""
+        if hasattr(self.policy, "get_expert_assignments"):
+            return self.policy.get_expert_assignments()
+        return None
+
 
 class Convolutional(nn.Module):
     def __init__(

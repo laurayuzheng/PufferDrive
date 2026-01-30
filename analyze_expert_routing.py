@@ -167,57 +167,59 @@ def analyze_router_distribution(checkpoint_path, num_scenarios=100, num_steps_pe
     router_logits_all = []
 
     num_experts = base_policy.num_experts
+    num_agents = env.num_agents
+    hidden_size = base_policy.hidden_size
 
     print(f"\nAnalyzing {num_scenarios} scenarios with {num_steps_per_scenario} steps each...")
-    print(f"Total samples: {num_scenarios * num_steps_per_scenario}")
-    print(f"Router type: {'SocialForcesRouter' if base_policy.use_social_forces_routing else 'PersonaRouter'}")
+    print(f"Agents per scenario: {num_agents}")
+    print(f"Total samples: {num_scenarios * num_steps_per_scenario * num_agents}")
+    print(f"Router type: {'SocialForcesRouterWithReconstruction' if base_policy.use_social_forces_routing else 'PersonaRouter'}")
 
     for scenario_idx in range(num_scenarios):
         obs, _ = env.reset()
 
-        # Initialize LSTM state
+        # Initialize LSTM state for ALL agents (matching training behavior)
         lstm_state = {
-            "lstm_h": None,
-            "lstm_c": None,
+            "lstm_h": torch.zeros(num_agents, hidden_size),
+            "lstm_c": torch.zeros(num_agents, hidden_size),
         }
 
         for step in range(num_steps_per_scenario):
             with torch.no_grad():
-                # Get observation for first agent only (obs may be [num_agents, obs_size])
-                if len(obs.shape) > 1:
-                    single_obs = obs[0]
-                else:
-                    single_obs = obs
-                obs_tensor = torch.tensor(single_obs, dtype=torch.float32).unsqueeze(0)
+                # Use ALL agents' observations (not just agent 0)
+                obs_tensor = torch.tensor(obs, dtype=torch.float32)
 
-                # Forward pass through full model (with LSTM)
+                # Forward pass through full model (with LSTM) - state is updated in-place
                 actions, _ = policy.forward_eval(obs_tensor, lstm_state)
 
-                # Get expert probs from the inner policy (set during encode_observations)
-                expert_probs = base_policy._expert_probs[0].numpy()
-                router_logits = base_policy._router_logits[0].numpy()
-                expert_assignment = np.argmax(expert_probs)
+                # Get expert probs from the inner policy for ALL agents
+                all_expert_probs = base_policy._expert_probs.numpy()  # (num_agents, num_experts)
+                all_router_logits = base_policy._router_logits.numpy()  # (num_agents, num_experts)
 
-                expert_counts[expert_assignment] += 1
-                expert_probs_all.append(expert_probs)
-                router_logits_all.append(router_logits)
+                # Record stats for each agent
+                for agent_idx in range(num_agents):
+                    agent_probs = all_expert_probs[agent_idx]
+                    agent_logits = all_router_logits[agent_idx]
+                    expert_assignment = np.argmax(agent_probs)
 
-                # Store sample info for each expert
-                samples_by_expert[expert_assignment].append({
-                    'scenario': scenario_idx,
-                    'step': step,
-                    'probs': expert_probs.copy(),
-                    'logits': router_logits.copy(),
-                })
+                    expert_counts[expert_assignment] += 1
+                    expert_probs_all.append(agent_probs.copy())
+                    router_logits_all.append(agent_logits.copy())
 
-                # Simple action selection for single agent, then tile for all agents
+                    # Store sample info for each expert
+                    samples_by_expert[expert_assignment].append({
+                        'scenario': scenario_idx,
+                        'step': step,
+                        'agent': agent_idx,
+                        'probs': agent_probs.copy(),
+                        'logits': agent_logits.copy(),
+                    })
+
+                # Get actions for all agents
                 if isinstance(actions, tuple):
-                    single_action = np.array([a.argmax().item() for a in actions])
+                    action = np.stack([a.argmax(dim=-1).numpy() for a in actions], axis=-1)
                 else:
-                    single_action = actions[0].numpy()
-
-                # Tile action for all agents in the environment
-                action = np.tile(single_action, (env.num_agents, 1))
+                    action = actions.argmax(dim=-1, keepdim=True).numpy()
 
                 obs, _, done, truncated, _ = env.step(action)
 
@@ -226,8 +228,8 @@ def analyze_router_distribution(checkpoint_path, num_scenarios=100, num_steps_pe
                     obs, _ = env.reset()
                     # Reset LSTM state on episode boundary
                     lstm_state = {
-                        "lstm_h": None,
-                        "lstm_c": None,
+                        "lstm_h": torch.zeros(num_agents, hidden_size),
+                        "lstm_c": torch.zeros(num_agents, hidden_size),
                     }
 
         if (scenario_idx + 1) % 20 == 0:
@@ -334,7 +336,7 @@ def analyze_router_distribution(checkpoint_path, num_scenarios=100, num_steps_pe
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", "-c", type=str,
-                       default="experiments/puffer_drive_moe_932h6awx.pt",
+                       default="experiments/puffer_drive_moe_05ekubwk.pt",
                        help="Path to MoE checkpoint")
     parser.add_argument("--num-scenarios", "-n", type=int, default=200,
                        help="Number of scenarios to test")

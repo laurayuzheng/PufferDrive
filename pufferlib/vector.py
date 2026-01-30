@@ -203,6 +203,100 @@ class Serial:
 
         return np.concatenate(all_expert_actions), np.concatenate(all_valid_masks)
 
+    def get_future_trajectories(self, num_future_frames=40):
+        """Get ground truth future trajectories for current timestep from all environments.
+
+        Returns:
+            future_traj: Array of shape (num_agents, num_future_frames, 2) in local coordinates
+            valid_mask: Boolean array of shape (num_agents, num_future_frames)
+        """
+        all_future_trajs = []
+        all_valid_masks = []
+
+        for env in self.envs:
+            if hasattr(env, "get_future_trajectory_at_timestep"):
+                timestep = getattr(env, "tick", 0)
+                future_traj, valid_mask = env.get_future_trajectory_at_timestep(timestep, num_future_frames)
+                all_future_trajs.append(future_traj)
+                all_valid_masks.append(valid_mask)
+            else:
+                num_agents = env.num_agents
+                all_future_trajs.append(np.zeros((num_agents, num_future_frames, 2), dtype=np.float32))
+                all_valid_masks.append(np.zeros((num_agents, num_future_frames), dtype=bool))
+
+        return np.concatenate(all_future_trajs), np.concatenate(all_valid_masks)
+
+    def get_agent_positions(self):
+        """Get current agent positions from all environments.
+
+        Returns:
+            positions: Dict with 'x', 'y', 'heading' arrays of shape (num_agents,)
+        """
+        all_x = []
+        all_y = []
+        all_heading = []
+
+        for env in self.envs:
+            if hasattr(env, "get_agent_positions"):
+                positions = env.get_agent_positions()
+                all_x.append(positions["x"])
+                all_y.append(positions["y"])
+                all_heading.append(positions["heading"])
+            else:
+                num_agents = env.num_agents
+                all_x.append(np.zeros(num_agents, dtype=np.float32))
+                all_y.append(np.zeros(num_agents, dtype=np.float32))
+                all_heading.append(np.zeros(num_agents, dtype=np.float32))
+
+        return {
+            "x": np.concatenate(all_x),
+            "y": np.concatenate(all_y),
+            "heading": np.concatenate(all_heading),
+        }
+
+    def get_logged_goals(self):
+        """Get logged trajectory endpoints in ego-centric frame from all environments.
+
+        Returns:
+            logged_goals: Array of shape (num_agents, 2) with [goal_x, goal_y]
+            valid_mask: Boolean array of shape (num_agents,) indicating valid goals
+        """
+        all_goal_x = []
+        all_goal_y = []
+        all_valid = []
+
+        for env in self.envs:
+            if hasattr(env, "get_logged_goals_ego_frame"):
+                goal_x, goal_y, valid = env.get_logged_goals_ego_frame()
+                all_goal_x.append(goal_x)
+                all_goal_y.append(goal_y)
+                all_valid.append(valid.astype(bool))
+            else:
+                num_agents = env.num_agents
+                all_goal_x.append(np.zeros(num_agents, dtype=np.float32))
+                all_goal_y.append(np.zeros(num_agents, dtype=np.float32))
+                all_valid.append(np.zeros(num_agents, dtype=bool))
+
+        goals = np.stack([np.concatenate(all_goal_x), np.concatenate(all_goal_y)], axis=1)
+        return goals, np.concatenate(all_valid)
+
+    def set_predicted_goals(self, goal_x, goal_y):
+        """Set predicted goals from policy output for all environments.
+
+        Args:
+            goal_x: numpy array of shape (num_agents,) - x coordinate in scaled space
+            goal_y: numpy array of shape (num_agents,) - y coordinate in scaled space
+        """
+        offset = 0
+        for env in self.envs:
+            if hasattr(env, "set_predicted_goals"):
+                num_agents = env.num_agents
+                env.set_predicted_goals(
+                    goal_x[offset : offset + num_agents],
+                    goal_y[offset : offset + num_agents],
+                )
+                offset += num_agents
+
 
 def _worker_process(
     env_creators,
@@ -221,6 +315,7 @@ def _worker_process(
     shm,
     is_native,
     seed,
+    num_future_frames=40,
 ):
     # Environments read and write directly to shared memory
     shape = (num_workers, num_envs * num_agents)
@@ -239,6 +334,18 @@ def _worker_process(
     # expert_actions has shape (num_workers, agents_per_worker, 2) for [accel_idx, steer_idx]
     expert_actions_arr = np.ndarray((*shape, 2), dtype=np.int64, buffer=shm["expert_actions"])[worker_idx]
     expert_valid_arr = np.ndarray(shape, dtype=bool, buffer=shm["expert_valid"])[worker_idx]
+
+    # Future trajectory shared memory buffers for trajectory prediction loss
+    future_traj_arr = np.ndarray((*shape, num_future_frames, 2), dtype=np.float32, buffer=shm["future_traj"])[worker_idx]
+    future_valid_arr = np.ndarray((*shape, num_future_frames), dtype=bool, buffer=shm["future_valid"])[worker_idx]
+
+    # Goal prediction shared memory buffers
+    agent_pos_x_arr = np.ndarray(shape, dtype=np.float32, buffer=shm["agent_pos_x"])[worker_idx]
+    agent_pos_y_arr = np.ndarray(shape, dtype=np.float32, buffer=shm["agent_pos_y"])[worker_idx]
+    agent_heading_arr = np.ndarray(shape, dtype=np.float32, buffer=shm["agent_heading"])[worker_idx]
+    logged_goals_arr = np.ndarray((*shape, 2), dtype=np.float32, buffer=shm["logged_goals"])[worker_idx]
+    logged_goals_valid_arr = np.ndarray(shape, dtype=bool, buffer=shm["logged_goals_valid"])[worker_idx]
+    predicted_goals_arr = np.ndarray((*shape, 2), dtype=np.float32, buffer=shm["predicted_goals"])[worker_idx]
 
     if is_native and num_envs == 1:
         envs = env_creators[0](*env_args[0], **env_kwargs[0], buf=buf, seed=seed)
@@ -259,6 +366,62 @@ def _worker_process(
             expert_actions_arr[:] = exp_act
             expert_valid_arr[:] = exp_valid
 
+    # Helper to update future trajectories from environment(s)
+    def update_future_trajectories():
+        if hasattr(envs, "get_future_trajectories"):
+            # Serial backend has get_future_trajectories
+            fut_traj, fut_valid = envs.get_future_trajectories(num_future_frames)
+            future_traj_arr[:] = fut_traj
+            future_valid_arr[:] = fut_valid
+        elif hasattr(envs, "get_future_trajectory_at_timestep"):
+            # Native PufferEnv (e.g., Drive) has get_future_trajectory_at_timestep
+            timestep = getattr(envs, "tick", 0)
+            fut_traj, fut_valid = envs.get_future_trajectory_at_timestep(timestep, num_future_frames)
+            future_traj_arr[:] = fut_traj
+            future_valid_arr[:] = fut_valid
+
+    # Helper to update goal prediction data from environment(s)
+    def update_goal_data():
+        if hasattr(envs, "get_agent_positions"):
+            # Serial backend has get_agent_positions
+            positions = envs.get_agent_positions()
+            agent_pos_x_arr[:] = positions["x"]
+            agent_pos_y_arr[:] = positions["y"]
+            agent_heading_arr[:] = positions["heading"]
+        elif hasattr(envs, "get_agent_positions"):
+            # Native PufferEnv (e.g., Drive) has get_agent_positions
+            positions = envs.get_agent_positions()
+            agent_pos_x_arr[:] = positions["x"]
+            agent_pos_y_arr[:] = positions["y"]
+            agent_heading_arr[:] = positions["heading"]
+
+        if hasattr(envs, "get_logged_goals"):
+            # Serial backend has get_logged_goals
+            goals, valid = envs.get_logged_goals()
+            logged_goals_arr[:] = goals
+            logged_goals_valid_arr[:] = valid
+        elif hasattr(envs, "get_logged_goals_ego_frame"):
+            # Native PufferEnv (e.g., Drive) has get_logged_goals_ego_frame
+            goal_x, goal_y, valid = envs.get_logged_goals_ego_frame()
+            logged_goals_arr[:, 0] = goal_x
+            logged_goals_arr[:, 1] = goal_y
+            logged_goals_valid_arr[:] = valid.astype(bool)
+
+    def apply_predicted_goals():
+        """Apply predicted goals from shared memory to the environment before step."""
+        if hasattr(envs, "set_predicted_goals"):
+            # Serial backend has set_predicted_goals
+            envs.set_predicted_goals(
+                predicted_goals_arr[:, 0].copy(),
+                predicted_goals_arr[:, 1].copy(),
+            )
+        elif hasattr(envs, "set_predicted_goals"):
+            # Native PufferEnv (e.g., Drive) has set_predicted_goals
+            envs.set_predicted_goals(
+                predicted_goals_arr[:, 0].copy(),
+                predicted_goals_arr[:, 1].copy(),
+            )
+
     semaphores = np.ndarray(num_workers, dtype=np.uint8, buffer=shm["semaphores"])
     notify = np.ndarray(num_workers, dtype=bool, buffer=shm["notify"])
     start = time.time()
@@ -278,9 +441,14 @@ def _worker_process(
             seed = recv_pipe.recv()
             _, infos = envs.reset(seed=seed)
             update_expert_actions()
+            update_future_trajectories()
+            update_goal_data()
         elif sem == STEP:
+            apply_predicted_goals()  # Set predicted goals before step so reward uses them
             _, _, _, _, infos = envs.step(atn_arr)
             update_expert_actions()
+            update_future_trajectories()
+            update_goal_data()
         elif sem == CLOSE:
             envs.close()
             send_pipe.send(None)
@@ -318,6 +486,7 @@ class Multiprocessing:
         sync_traj=True,
         overwork=False,
         seed=0,
+        num_future_frames=40,
         **kwargs,
     ):
         if batch_size is None:
@@ -384,6 +553,9 @@ class Multiprocessing:
 
         # Mac breaks without setting fork... but setting it breaks sweeps on 2nd run
         # set_start_method('fork')
+        # Future trajectory buffer size (for trajectory prediction loss)
+        self.num_future_frames = num_future_frames
+
         self.shm = dict(
             observations=RawArray(obs_ctype, num_agents * int(np.prod(obs_shape))),
             actions=RawArray(atn_ctype, num_agents * int(np.prod(atn_shape))),
@@ -396,6 +568,17 @@ class Multiprocessing:
             # Expert action buffers for imitation learning
             expert_actions=RawArray("q", num_agents * 2),  # int64 for [accel_idx, steer_idx]
             expert_valid=RawArray("b", num_agents),  # bool for validity mask
+            # Future trajectory buffers for trajectory prediction loss
+            future_traj=RawArray("f", num_agents * num_future_frames * 2),  # float32 for [x, y]
+            future_valid=RawArray("b", num_agents * num_future_frames),  # bool for validity mask
+            # Goal prediction buffers
+            agent_pos_x=RawArray("f", num_agents),  # float32 for agent x position
+            agent_pos_y=RawArray("f", num_agents),  # float32 for agent y position
+            agent_heading=RawArray("f", num_agents),  # float32 for agent heading
+            logged_goals=RawArray("f", num_agents * 2),  # float32 for [goal_x, goal_y]
+            logged_goals_valid=RawArray("b", num_agents),  # bool for validity mask
+            # Predicted goals (from policy, written by main process, read by workers)
+            predicted_goals=RawArray("f", num_agents * 2),  # float32 for [goal_x, goal_y]
         )
         shape = (num_workers, agents_per_worker)
         self.obs_batch_shape = (self.agents_per_batch, *obs_shape)
@@ -412,6 +595,17 @@ class Multiprocessing:
             # Expert action buffers
             expert_actions=np.ndarray((*shape, 2), dtype=np.int64, buffer=self.shm["expert_actions"]),
             expert_valid=np.ndarray(shape, dtype=bool, buffer=self.shm["expert_valid"]),
+            # Future trajectory buffers
+            future_traj=np.ndarray((*shape, num_future_frames, 2), dtype=np.float32, buffer=self.shm["future_traj"]),
+            future_valid=np.ndarray((*shape, num_future_frames), dtype=bool, buffer=self.shm["future_valid"]),
+            # Goal prediction buffers
+            agent_pos_x=np.ndarray(shape, dtype=np.float32, buffer=self.shm["agent_pos_x"]),
+            agent_pos_y=np.ndarray(shape, dtype=np.float32, buffer=self.shm["agent_pos_y"]),
+            agent_heading=np.ndarray(shape, dtype=np.float32, buffer=self.shm["agent_heading"]),
+            logged_goals=np.ndarray((*shape, 2), dtype=np.float32, buffer=self.shm["logged_goals"]),
+            logged_goals_valid=np.ndarray(shape, dtype=bool, buffer=self.shm["logged_goals_valid"]),
+            # Predicted goals (written by main process, read by workers)
+            predicted_goals=np.ndarray((*shape, 2), dtype=np.float32, buffer=self.shm["predicted_goals"]),
         )
         self.buf["semaphores"][:] = MAIN
 
@@ -445,6 +639,7 @@ class Multiprocessing:
                     self.shm,
                     is_native,
                     seed_i,
+                    num_future_frames,
                 ),
             )
             p.start()
@@ -596,6 +791,64 @@ class Multiprocessing:
         expert_actions = self.buf["expert_actions"][w_slice].reshape(-1, 2)
         expert_valid = self.buf["expert_valid"][w_slice].ravel()
         return expert_actions, expert_valid
+
+    def get_future_trajectories(self, num_future_frames=None):
+        """Get future trajectories for trajectory prediction loss from all workers.
+
+        Returns:
+            future_traj: Array of shape (agents_per_batch, num_future_frames, 2) in local coordinates
+            valid_mask: Boolean array of shape (agents_per_batch, num_future_frames)
+        """
+        if num_future_frames is None:
+            num_future_frames = self.num_future_frames
+        w_slice = self.w_slice
+        future_traj = self.buf["future_traj"][w_slice].reshape(-1, num_future_frames, 2)
+        future_valid = self.buf["future_valid"][w_slice].reshape(-1, num_future_frames)
+        return future_traj, future_valid
+
+    def get_agent_positions(self):
+        """Get current agent positions from all workers.
+
+        Returns:
+            positions: Dict with 'x', 'y', 'heading' arrays of shape (agents_per_batch,)
+        """
+        w_slice = self.w_slice
+        return {
+            "x": self.buf["agent_pos_x"][w_slice].ravel(),
+            "y": self.buf["agent_pos_y"][w_slice].ravel(),
+            "heading": self.buf["agent_heading"][w_slice].ravel(),
+        }
+
+    def get_logged_goals(self):
+        """Get logged trajectory endpoints in ego-centric frame from all workers.
+
+        Returns:
+            logged_goals: Array of shape (agents_per_batch, 2) with [goal_x, goal_y]
+            valid_mask: Boolean array of shape (agents_per_batch,) indicating valid goals
+        """
+        w_slice = self.w_slice
+        logged_goals = self.buf["logged_goals"][w_slice].reshape(-1, 2)
+        logged_goals_valid = self.buf["logged_goals_valid"][w_slice].ravel()
+        return logged_goals, logged_goals_valid.astype(bool)
+
+    def set_predicted_goals(self, goal_x, goal_y):
+        """Set predicted goals from policy output for all workers.
+
+        Args:
+            goal_x: numpy array of shape (agents_per_batch,) - x coordinate in scaled space
+            goal_y: numpy array of shape (agents_per_batch,) - y coordinate in scaled space
+
+        The goals are written to shared memory and will be read by workers
+        before the next step() call to update the environment's predicted goals.
+        """
+        w_slice = self.w_slice
+        # Reshape to (num_workers, agents_per_worker) and write to shared memory
+        self.buf["predicted_goals"][w_slice, :, 0] = goal_x.reshape(
+            self.workers_per_batch, -1
+        )
+        self.buf["predicted_goals"][w_slice, :, 1] = goal_y.reshape(
+            self.workers_per_batch, -1
+        )
 
     def close(self):
         self.driver_env.close()
@@ -816,7 +1069,7 @@ def make(env_creator_or_creators, env_args=None, env_kwargs=None, backend=Puffer
 
     # Sanity check args
     for k in kwargs:
-        if k not in ["num_workers", "batch_size", "zero_copy", "overwork", "backend"]:
+        if k not in ["num_workers", "batch_size", "zero_copy", "overwork", "backend", "num_future_frames"]:
             raise pufferlib.APIUsageError(f"Invalid argument: {k}")
 
     # TODO: First step action space check

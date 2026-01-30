@@ -48,10 +48,10 @@ bash scripts/build_ocean.sh drive web
 
 ```bash
 # Basic training (baseline)
-puffer train puffer_drive
+puffer train puffer_drive --wandb --wandb-project pufferdrive_goal --exp-name baseline
 
 # MoE training (latent variable modeling)
-puffer train puffer_drive_moe
+puffer train puffer_drive_moe --wandb --wandb-project pufferdrive --exp-name polysona
 
 # Distributed training (6 GPUs)
 torchrun --standalone --nnodes=1 --nproc-per-node=6 -m puffer train puffer_drive
@@ -74,7 +74,7 @@ puffer eval puffer_drive --eval.wosac-realism-eval True --load-model-path experi
 puffer eval puffer_drive_moe --eval.wosac-realism-eval True --load-model-path experiments/puffer_drive_moe_social_forces.pt
 
 # Most recent eval
-puffer eval puffer_drive_mtr  --eval.wosac-realism-eval True --load-model-path experiments/puffer_drive_mtr_base.pt 
+puffer eval puffer_drive_moe  --eval.wosac-realism-eval True --load-model-path experiments/puffer_drive_moe_05ekubwk.pt
 ```
 
 Results
@@ -157,7 +157,7 @@ python plt_visualize.py --output viz_output/trajectories.png --mode trajectories
 python plt_visualize.py --output viz_output/zoomed.gif --zoom-radius 30 --num-agents 7
 
 # latest command
-python plt_visualize.py --mode multiverse -o viz_output/multiverse.gif  --pov --forced-agent 2 --scenario 10 --config puffer_drive_moe --checkpoint experiments/puffer_drive_moe_diversity.pt
+python plt_visualize.py --mode multiverse -o viz_output/multiverse.gif  --pov --forced-agent 1 --scenario 10 --config puffer_drive_moe --batch-scenarios 0-100 --checkpoint experiments/puffer_drive_moe_05ekubwk.pt
 ```
 
 **Key options**:
@@ -672,50 +672,96 @@ where $\hat{\mathbf{f}} = \text{MLP}_{\text{recon}}(\mathbf{z})$ and $\mathbf{z}
 
 The total loss combines multiple objectives:
 
-$$\mathcal{L} = \mathcal{L}_{\text{PPO}} + \lambda_{\text{imit}}\mathcal{L}_{\text{imit}} + \lambda_{\text{kl}}\mathcal{L}_{\text{kl}} + \lambda_{\text{ent}}\mathcal{L}_{\text{ent}} + \lambda_{\text{cos}}\mathcal{L}_{\text{cos}} + \lambda_{\text{recon}}\mathcal{L}_{\text{recon}} + \lambda_{\text{div}}\mathcal{L}_{\text{div}}$$
+$$\mathcal{L} = \mathcal{L}_{\text{PPO}} + \lambda_{\text{imit}}\mathcal{L}_{\text{imit}} + \lambda_{\text{traj}}\mathcal{L}_{\text{traj}} + \lambda_{\text{kl}}\mathcal{L}_{\text{kl}} + \lambda_{\text{ent}}\mathcal{L}_{\text{ent}} + \lambda_{\text{cos}}\mathcal{L}_{\text{cos}} + \lambda_{\text{recon}}\mathcal{L}_{\text{recon}} + \lambda_{\text{div}}\mathcal{L}_{\text{div}}$$
 
 where:
 - $\mathcal{L}_{\text{PPO}}$: Proximal Policy Optimization loss
 - $\mathcal{L}_{\text{imit}}$: Imitation loss (cross-entropy with expert actions)
+- $\mathcal{L}_{\text{traj}}$: Trajectory prediction loss (GMM NLL on full trajectory)
 - $\mathcal{L}_{\text{kl}}$: KL divergence encouraging uniform expert usage
 - $\mathcal{L}_{\text{ent}}$: Negative entropy encouraging confident routing
 - $\mathcal{L}_{\text{cos}}$: Cosine similarity penalty for expert weight diversity
 - $\mathcal{L}_{\text{recon}}$: Social forces reconstruction loss
 - $\mathcal{L}_{\text{div}}$: Output diversity loss encouraging different expert behaviors
 
+#### 4.5 Trajectory Prediction Loss
+
+The trajectory loss supervises the full multi-step trajectory prediction using GMM negative log-likelihood, following the original MTR formulation. For each predicted trajectory mode $k$:
+
+$$\mathcal{L}_{\text{traj}} = -\log \mathcal{N}(\mathbf{x}_t^{\text{gt}} | \boldsymbol{\mu}_{k^*,t}, \boldsymbol{\Sigma}_{k^*,t})$$
+
+where $k^* = \arg\min_k \|\boldsymbol{\mu}_{k,T} - \mathbf{x}_T^{\text{gt}}\|$ (winner-takes-all selection) and:
+
+$$\boldsymbol{\Sigma}_{k,t} = \begin{pmatrix} \sigma_x^2 & \rho\sigma_x\sigma_y \\ \rho\sigma_x\sigma_y & \sigma_y^2 \end{pmatrix}$$
+
+The bivariate Gaussian NLL per timestep is:
+$$-\log \mathcal{N} = \log\sigma_x + \log\sigma_y + \frac{1}{2}\log(1-\rho^2) + \frac{1}{2(1-\rho^2)}\left[\frac{\Delta x^2}{\sigma_x^2} + \frac{\Delta y^2}{\sigma_y^2} - \frac{2\rho \Delta x \Delta y}{\sigma_x\sigma_y}\right]$$
+
+The loss is summed over all $T=40$ future timesteps.
+
+#### 4.6 Loss Coefficient Tuning
+
+Critical insight: the GMM trajectory loss is summed over 40 timesteps, making its raw magnitude **much larger** than other losses:
+
+| Loss | Typical Magnitude | Coefficient | Contribution |
+|------|-------------------|-------------|--------------|
+| PPO policy gradient | 0.01 - 0.1 | 1.0 | 0.01 - 0.1 |
+| Value loss | 0.1 - 1.0 | 2.0 | 0.2 - 2.0 |
+| Entropy | 1 - 3 | 0.005 | 0.005 - 0.015 |
+| Imitation (CE) | 1 - 4 | 0.05 | 0.05 - 0.2 |
+| **Trajectory (GMM NLL)** | **40 - 160** | **0.01** | **0.4 - 1.6** |
+| MoE auxiliary | ~1 | 0.01 - 0.1 | 0.01 - 0.1 |
+
+With `traj_loss_coef = 0.01`, the trajectory loss contributes ~0.4-1.6 to the total loss, comparable to the value loss and ensuring PPO remains the dominant learning signal.
+
 ### 5. Implementation Details
 
 #### 5.1 Architecture Parameters
 
-| Component | Parameter | DriveMTR (minimal) | DriveMTRMoE |
+| Component | Parameter | DriveMTR | DriveMTRMoE |
 |-----------|-----------|----------|-------------|
-| Encoder | d_model | 64 | 128 |
-| Encoder | num_layers | 2 | 3 |
-| Encoder | num_heads | 2 | 4 |
-| Decoder | num_layers | 2 | 3 |
+| Encoder | d_model | 64 | 64 |
+| Encoder | num_layers | 2 | 2 |
+| Encoder | num_heads | 2 | 2 |
+| Decoder | num_layers | 2 | 2 |
 | Decoder | num_queries | 4 | 4 |
 | Decoder | num_future_frames | 40 | 40 |
 | MoE | num_experts | - | 3 |
 | MoE | lora_rank | - | 8 |
-| MoE | lora_alpha | - | 4.0 |
+| MoE | lora_alpha | - | 8.0 |
 
 Three configuration tiers are available:
 - **Original** (d_model=256, 6 layers): ~26M params, requires multi-GPU
 - **Lite** (d_model=128, 3 layers): ~3.7M params, requires ~24GB VRAM
-- **Minimal** (d_model=64, 2 layers): ~1M params, fits on 16GB GPU
+- **Minimal** (d_model=64, 2 layers): ~1M params, fits on 16GB GPU (current default)
 
-#### 5.2 Key Differences from Standard MTR
+#### 5.2 Training Hyperparameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `imit_coef` | 0.05 | Imitation learning coefficient |
+| `traj_loss_coef` | 0.01 | Trajectory GMM NLL coefficient |
+| `aux_kl_coef` | 0.1 | Expert routing KL divergence |
+| `aux_entropy_coef` | 0.01 | Router entropy penalty |
+| `aux_cosine_coef` | 0.01 | Expert weight diversity |
+| `aux_reconstruction_coef` | 1.0 | Social forces reconstruction |
+| `aux_output_div_coef` | 0.01 | Expert output diversity |
+| `learning_rate` | 0.0003 | Adam learning rate |
+| `batch_size` | 262144 | Total batch size |
+| `minibatch_size` | 2048 | Minibatch for gradient updates |
+
+#### 5.3 Key Differences from Standard MTR
 
 | Aspect | Standard MTR | Closed-Loop MTR |
 |--------|--------------|-----------------|
 | **Training** | Supervised learning | Reinforcement learning (PPO) |
 | **Output** | Position sequences | Action GMM + discretization |
 | **Execution** | Full trajectory | First timestep only (MPC-style) |
-| **Loss** | Winner-takes-all NLL | PPO + imitation + auxiliary |
-| **Temporal context** | Fixed history window | Recurrent state (optional) |
+| **Loss** | Winner-takes-all NLL | PPO + imitation + trajectory + auxiliary |
+| **Temporal context** | Fixed history window | Per-step re-encoding |
 | **Mode selection** | Post-hoc scoring | Learned confidence heads |
 
-#### 5.3 File Structure
+#### 5.4 File Structure
 
 ```
 pufferlib/ocean/
@@ -724,10 +770,37 @@ pufferlib/ocean/
 ├── moe_adapters.py       # LoRAExpertsRL, PersonaRouterWithReconstruction
 └── inverse_dynamics.py   # Expert action computation for imitation
 
+pufferlib/ocean/drive/
+└── drive.py              # get_future_trajectory_at_timestep() for trajectory loss
+
+pufferlib/
+├── pufferl.py            # Training loop with trajectory loss integration
+└── vector.py             # get_future_trajectories() for vectorized envs
+
 pufferlib/config/ocean/
 ├── puffer_drive_mtr.ini      # Baseline MTR configuration
 └── puffer_drive_mtr_moe.ini  # MTR-MoE configuration
 ```
+
+#### 5.5 Trajectory Loss Implementation
+
+Ground truth future trajectories are obtained per-timestep during rollouts and transformed to ego-centric (local) coordinates:
+
+1. **Data collection** (`drive.py:get_future_trajectory_at_timestep`):
+   - Get current ego position $(x_0, y_0)$ and heading $\theta$
+   - Get GT future positions $(x_t, y_t)$ for $t \in [1, T]$
+   - Transform to local: $x'_t = \cos(-\theta)(x_t - x_0) - \sin(-\theta)(y_t - y_0)$
+
+2. **Buffer storage** (`pufferl.py`):
+   - `future_traj`: (segments, horizon, T, 2) - local coordinates
+   - `future_valid`: (segments, horizon, T) - validity mask
+
+3. **Loss computation** (`torch_mtr.py:get_trajectory_loss`):
+   - Integrate predicted actions to trajectory via bicycle model
+   - Winner-takes-all: select mode closest to GT endpoint
+   - Compute bivariate Gaussian NLL summed over timesteps
+
+**Note**: Currently only supported with Serial backend. Multiprocessing backend returns empty arrays (trajectory loss skipped).
 
 ### 6. References
 
@@ -735,3 +808,289 @@ pufferlib/config/ocean/
 - Hu, E. J., et al. "LoRA: Low-Rank Adaptation of Large Language Models." ICLR 2022.
 - Schulman, J., et al. "Proximal Policy Optimization Algorithms." arXiv 2017.
 - Helbing, D., & Molnár, P. "Social Force Model for Pedestrian Dynamics." Physical Review E, 1995.
+
+---
+
+## Closed-Loop Drive and DriveMoE: Technical Report
+
+### Abstract
+
+We present Drive and DriveMoE, lightweight neural network policies for closed-loop autonomous driving control within the PufferDrive simulator. Drive is a baseline MLP-based architecture that processes multi-modal observations (ego state, road geometry, neighboring agents) through parallel encoders with permutation-invariant pooling. DriveMoE extends this baseline with a Mixture-of-Experts (MoE) framework for latent driving style modeling, employing Low-Rank Adaptation (LoRA) for parameter-efficient expert specialization and a physics-informed social forces router for context-aware expert selection. We describe the architectural design, training objectives, and auxiliary regularization techniques that enable stable multi-expert learning under reinforcement learning.
+
+### 1. Introduction
+
+Autonomous driving policies must process complex, variable-size observations and produce control actions in real-time. While Transformer-based architectures such as MTR (Shi et al., 2022) achieve state-of-the-art performance on trajectory prediction benchmarks, their computational overhead limits applicability in high-throughput simulation settings where millions of environment steps are required for policy optimization.
+
+We propose Drive, a computationally efficient policy architecture that achieves competitive performance with significantly reduced parameter count (~70K vs. 1M+ for Transformer variants). The architecture employs separate encoders for each observation modality with max-pooling aggregation, enabling processing of variable numbers of road segments and neighboring agents.
+
+We further propose DriveMoE, an extension that models latent driving styles through a Mixture-of-Experts framework. Rather than learning a single averaged policy, DriveMoE learns $K$ specialized expert policies and a router that selects among them based on the driving context. This enables:
+
+1. **Style-consistent behavior**: Agents maintain coherent driving patterns across time
+2. **Multi-modal action distributions**: Different experts can specialize in different maneuvers
+3. **Interpretable decomposition**: Expert assignments provide insight into decision-making
+
+### 2. Problem Formulation
+
+We formulate closed-loop driving as a Markov Decision Process $(\mathcal{S}, \mathcal{A}, P, R, \gamma)$ where:
+
+- **State space** $\mathcal{S}$: Observations comprising ego state $\mathbf{s}^{\text{ego}} \in \mathbb{R}^{d_e}$, road geometry $\mathbf{S}^{\text{road}} \in \mathbb{R}^{N_r \times d_r}$, and partner agents $\mathbf{S}^{\text{partner}} \in \mathbb{R}^{N_p \times d_p}$
+- **Action space** $\mathcal{A}$: Discrete actions $a = (a^{\text{accel}}, a^{\text{steer}}) \in \{1, \ldots, 7\} \times \{1, \ldots, 13\}$
+- **Transition dynamics** $P$: Governed by bicycle model physics in Box2D
+- **Reward function** $R$: Sparse goal-reaching reward with collision penalties
+- **Discount factor** $\gamma = 0.98$
+
+The objective is to learn a policy $\pi_\theta(a|s)$ that maximizes expected discounted return:
+
+$$J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}\left[\sum_{t=0}^{T} \gamma^t R(s_t, a_t)\right]$$
+
+### 3. Drive Architecture
+
+#### 3.1 Observation Encoding
+
+The observation vector is partitioned into three modalities, each processed by a dedicated encoder.
+
+**Ego Encoder.** The ego state vector $\mathbf{s}^{\text{ego}} \in \mathbb{R}^{d_e}$ contains kinematic information:
+
+$$\mathbf{s}^{\text{ego}} = [x, y, v_x, v_y, \cos\theta, \sin\theta, v, \ldots]^\top$$
+
+where $d_e = 7$ for classic dynamics or $d_e = 10$ for jerk-based dynamics. The encoder applies a two-layer MLP with layer normalization:
+
+$$\mathbf{h}^{\text{ego}} = f_{\text{ego}}(\mathbf{s}^{\text{ego}}) = \mathbf{W}_2^{\text{ego}} \cdot \text{LN}(\mathbf{W}_1^{\text{ego}} \mathbf{s}^{\text{ego}} + \mathbf{b}_1^{\text{ego}}) + \mathbf{b}_2^{\text{ego}}$$
+
+where $\mathbf{W}_1^{\text{ego}} \in \mathbb{R}^{d_h \times d_e}$, $\mathbf{W}_2^{\text{ego}} \in \mathbb{R}^{d_h \times d_h}$, and $d_h$ is the hidden dimension.
+
+**Partner Encoder.** Neighboring agents are represented as a set $\mathbf{S}^{\text{partner}} = \{\mathbf{s}_i^{\text{partner}}\}_{i=1}^{N_p}$ where each element contains:
+
+$$\mathbf{s}_i^{\text{partner}} = [\Delta x_i, \Delta y_i, w_i, l_i, \cos\psi_i, \sin\psi_i, v_i]^\top \in \mathbb{R}^{7}$$
+
+The encoder processes each agent independently and aggregates via max-pooling for permutation invariance:
+
+$$\mathbf{h}^{\text{partner}} = \max_{i \in \{1, \ldots, N_p\}} f_{\text{partner}}(\mathbf{s}_i^{\text{partner}})$$
+
+**Road Encoder.** Road segments are represented as $\mathbf{S}^{\text{road}} = \{\mathbf{s}_j^{\text{road}}\}_{j=1}^{N_r}$ with continuous features (position, orientation) and a categorical road type. The categorical feature is one-hot encoded:
+
+$$\tilde{\mathbf{s}}_j^{\text{road}} = [\mathbf{s}_{j,1:d_r-1}^{\text{road}}, \text{onehot}(s_{j,d_r}^{\text{road}})]^\top \in \mathbb{R}^{d_r + 6}$$
+
+The encoder follows the same structure as the partner encoder:
+
+$$\mathbf{h}^{\text{road}} = \max_{j \in \{1, \ldots, N_r\}} f_{\text{road}}(\tilde{\mathbf{s}}_j^{\text{road}})$$
+
+#### 3.2 Feature Fusion
+
+The modality-specific features are concatenated and projected through a shared embedding layer:
+
+$$\mathbf{z} = \text{GELU}\left(\mathbf{W}^{\text{emb}} [\mathbf{h}^{\text{ego}}; \mathbf{h}^{\text{road}}; \mathbf{h}^{\text{partner}}] + \mathbf{b}^{\text{emb}}\right)$$
+
+where $\mathbf{W}^{\text{emb}} \in \mathbb{R}^{d_z \times 3d_h}$ and $\mathbf{z} \in \mathbb{R}^{d_z}$ is the fused representation.
+
+#### 3.3 Actor-Critic Heads
+
+**Actor.** The policy head outputs logits for each action dimension:
+
+$$\boldsymbol{\ell} = \mathbf{W}^{\text{actor}} \mathbf{z} + \mathbf{b}^{\text{actor}}, \quad \boldsymbol{\ell} \in \mathbb{R}^{|\mathcal{A}_{\text{accel}}| + |\mathcal{A}_{\text{steer}}|}$$
+
+The logits are split into acceleration and steering components:
+
+$$\pi(a^{\text{accel}}|s) = \text{softmax}(\boldsymbol{\ell}_{1:7}), \quad \pi(a^{\text{steer}}|s) = \text{softmax}(\boldsymbol{\ell}_{8:20})$$
+
+**Critic.** The value function is a linear projection:
+
+$$V(s) = \mathbf{w}^{\text{value}} \cdot \mathbf{z} + b^{\text{value}}$$
+
+#### 3.4 Temporal Modeling
+
+For settings requiring temporal context, the policy is wrapped with an LSTM layer that maintains hidden states $(\mathbf{h}_t, \mathbf{c}_t)$ across timesteps:
+
+$$\mathbf{h}_t, \mathbf{c}_t = \text{LSTM}(\mathbf{z}_t, \mathbf{h}_{t-1}, \mathbf{c}_{t-1})$$
+
+The LSTM output replaces $\mathbf{z}$ in subsequent actor-critic computations.
+
+### 4. DriveMoE: Mixture-of-Experts Extension
+
+#### 4.1 Low-Rank Expert Adaptation
+
+Full expert networks with separate parameters per expert are prohibitively expensive. Following Hu et al. (2022), we employ Low-Rank Adaptation (LoRA) to parameterize expert-specific modifications to a shared base network.
+
+For the actor layer with base weights $\mathbf{W} \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$, we introduce $K$ expert-specific low-rank decompositions:
+
+$$\Delta\mathbf{W}_k = \mathbf{B}_k \mathbf{A}_k, \quad \mathbf{A}_k \in \mathbb{R}^{r \times d_{\text{in}}}, \quad \mathbf{B}_k \in \mathbb{R}^{d_{\text{out}} \times r}$$
+
+where $r \ll \min(d_{\text{in}}, d_{\text{out}})$ is the rank hyperparameter.
+
+Given routing weights $\mathbf{p} = [p_1, \ldots, p_K]^\top$ from the router, the effective weight matrix is:
+
+$$\mathbf{W}_{\text{eff}} = \mathbf{W} + \frac{\alpha}{r} \sum_{k=1}^{K} p_k \cdot \mathbf{B}_k \mathbf{A}_k$$
+
+where $\alpha$ is a scaling hyperparameter. The forward pass computes:
+
+$$\mathbf{y} = \mathbf{W}\mathbf{x} + \mathbf{b} + \frac{\alpha}{r} \sum_{k=1}^{K} p_k \cdot \mathbf{B}_k (\mathbf{A}_k \mathbf{x})$$
+
+This formulation mixes expert weights before computation (the "expert" variant from Polysona), which is more parameter-efficient than mixing outputs post-computation.
+
+#### 4.2 Expert Routing
+
+**Learned Router.** The PersonaRouter computes routing probabilities from the concatenated features:
+
+$$\mathbf{p} = \text{softmax}\left(\mathbf{W}_2^{\text{router}} \cdot \text{ReLU}\left(\text{LN}(\mathbf{W}_1^{\text{router}} \mathbf{h}^{\text{concat}})\right)\right)$$
+
+where $\mathbf{h}^{\text{concat}} = [\mathbf{h}^{\text{ego}}; \mathbf{h}^{\text{road}}; \mathbf{h}^{\text{partner}}]$.
+
+**Social Forces Router.** Inspired by pedestrian dynamics (Helbing & Molnár, 1995), we propose a physics-informed router based on social forces—repulsive interactions between the ego agent and neighbors.
+
+For each neighbor $i$ at relative position $\mathbf{r}_i = (\Delta x_i, \Delta y_i)$, the repulsive force magnitude is:
+
+$$F_i = A \cdot \exp\left(\frac{D - \|\mathbf{r}_i\|}{B}\right)$$
+
+where $A$, $B$, $D$ are force parameters. The force vector is:
+
+$$\mathbf{f}_i = F_i \cdot \frac{-\mathbf{r}_i}{\|\mathbf{r}_i\|}$$
+
+We aggregate force statistics into a feature vector:
+
+$$\boldsymbol{\phi} = \left[\sum_i f_{i,x}, \sum_i f_{i,y}, \bar{F}, \max_i F_i, \sigma_F, \frac{|\{i : F_i > 0\}|}{N_p}\right]^\top \in \mathbb{R}^6$$
+
+The router optionally fuses social forces with learned context features:
+
+$$\mathbf{p} = \text{softmax}\left(g_{\text{router}}([\boldsymbol{\phi}; \mathbf{h}^{\text{concat}}])\right)$$
+
+or uses social forces alone when `social_forces_only=True`.
+
+#### 4.3 Training Mode vs. Inference Mode
+
+During training, we use soft routing with softmax probabilities to enable gradient flow through all experts. During inference, we use hard routing via argmax selection:
+
+$$\text{Training: } \mathbf{p} = \text{softmax}(\boldsymbol{\ell}^{\text{router}}), \quad \text{Inference: } \mathbf{p} = \text{onehot}(\arg\max_k \ell_k^{\text{router}})$$
+
+### 5. Training Objectives
+
+#### 5.1 Primary Objective: PPO
+
+We optimize the policy using Proximal Policy Optimization (Schulman et al., 2017). The clipped surrogate objective is:
+
+$$\mathcal{L}^{\text{PPO}}(\theta) = \mathbb{E}_t\left[\min\left(r_t(\theta) \hat{A}_t, \text{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon) \hat{A}_t\right)\right]$$
+
+where $r_t(\theta) = \frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)}$ is the importance ratio and $\hat{A}_t$ is the GAE advantage estimate.
+
+The value function loss is:
+
+$$\mathcal{L}^{\text{value}}(\theta) = \mathbb{E}_t\left[(V_\theta(s_t) - V_t^{\text{target}})^2\right]$$
+
+#### 5.2 Imitation Learning Auxiliary Loss
+
+To accelerate learning and improve sample efficiency, we incorporate behavioral cloning from human demonstrations. Expert actions $a^*$ are computed via inverse dynamics from logged human trajectories.
+
+The imitation loss is the cross-entropy between policy logits and expert actions:
+
+$$\mathcal{L}^{\text{imit}}(\theta) = -\mathbb{E}_{(s, a^*) \in \mathcal{D}}\left[\log \pi_\theta(a^*|s)\right]$$
+
+where $\mathcal{D}$ is the set of valid demonstration samples.
+
+#### 5.3 MoE Auxiliary Losses
+
+Training MoE models presents challenges including mode collapse (all inputs routed to one expert) and expert redundancy (experts learn identical behaviors). We employ several regularization techniques.
+
+**KL Divergence Loss.** Encourages uniform expert utilization across the batch:
+
+$$\mathcal{L}^{\text{KL}} = D_{\text{KL}}\left(\bar{\mathbf{p}} \| \mathbf{u}\right) = \sum_{k=1}^{K} \bar{p}_k \log\frac{\bar{p}_k}{1/K}$$
+
+where $\bar{\mathbf{p}} = \frac{1}{B}\sum_{i=1}^{B} \mathbf{p}^{(i)}$ is the batch-averaged routing distribution and $\mathbf{u}$ is the uniform prior.
+
+**Negative Entropy Loss.** Encourages confident (low-entropy) routing decisions:
+
+$$\mathcal{L}^{\text{ent}} = \mathbb{E}\left[\sum_{k=1}^{K} p_k \log p_k\right]$$
+
+Minimizing this loss pushes routing probabilities toward one-hot vectors.
+
+**Expert Weight Diversity Loss.** Penalizes similarity between expert weight modifications:
+
+$$\mathcal{L}^{\text{cos}} = \frac{1}{K(K-1)} \sum_{k \neq k'} \cos^2(\text{vec}(\Delta\mathbf{W}_k), \text{vec}(\Delta\mathbf{W}_{k'}))$$
+
+where $\Delta\mathbf{W}_k = \mathbf{B}_k \mathbf{A}_k$ and $\cos(\cdot, \cdot)$ is cosine similarity.
+
+**Output Diversity Loss.** Encourages experts to produce different action distributions:
+
+$$\mathcal{L}^{\text{div}} = -\frac{1}{K(K-1)} \sum_{k < k'} D_{\text{JS}}(\pi_k(\cdot|s) \| \pi_{k'}(\cdot|s))$$
+
+where $\pi_k$ is the policy using only expert $k$ and $D_{\text{JS}}$ is the Jensen-Shannon divergence.
+
+#### 5.4 Total Loss
+
+The complete training objective is:
+
+$$\mathcal{L}(\theta) = \mathcal{L}^{\text{PPO}} + \lambda_v \mathcal{L}^{\text{value}} + \lambda_{\text{imit}} \mathcal{L}^{\text{imit}} + \lambda_{\text{KL}} \mathcal{L}^{\text{KL}} + \lambda_{\text{ent}} \mathcal{L}^{\text{ent}} + \lambda_{\text{cos}} \mathcal{L}^{\text{cos}} + \lambda_{\text{div}} \mathcal{L}^{\text{div}}$$
+
+### 6. Implementation Details
+
+#### 6.1 Architecture Hyperparameters
+
+| Symbol | Parameter | Drive | DriveMoE |
+|--------|-----------|-------|----------|
+| $d_h$ | Encoder hidden dim | 64 | 64 |
+| $d_z$ | Embedding dim | 256 | 256 |
+| $K$ | Number of experts | — | 3 |
+| $r$ | LoRA rank | — | 8 |
+| $\alpha$ | LoRA scaling | — | 8.0 |
+
+#### 6.2 Training Hyperparameters
+
+| Symbol | Parameter | Value |
+|--------|-----------|-------|
+| $\gamma$ | Discount factor | 0.98 |
+| $\lambda_{\text{GAE}}$ | GAE lambda | 0.95 |
+| $\epsilon$ | PPO clip coefficient | 0.2 |
+| $\lambda_v$ | Value loss coefficient | 2.0 |
+| $\lambda_{\text{imit}}$ | Imitation coefficient | 0.05 |
+| $\lambda_{\text{KL}}$ | KL divergence coefficient | 100 |
+| $\lambda_{\text{ent}}$ | Entropy coefficient | 0.01 |
+| $\lambda_{\text{cos}}$ | Cosine similarity coefficient | 0.1 |
+| $\lambda_{\text{div}}$ | Output diversity coefficient | 0.01 |
+| — | Learning rate | $3 \times 10^{-4}$ |
+| — | Batch size | 524,288 |
+| — | Minibatch size | 4,096 |
+
+#### 6.3 Temperature Annealing
+
+The router temperature $\tau$ is linearly annealed during training:
+
+$$\tau(t) = \tau_{\max} - (\tau_{\max} - \tau_{\min}) \cdot \frac{t}{T}$$
+
+where $\tau_{\max} = 2.0$, $\tau_{\min} = 0.1$, and $T$ is total training steps. Higher temperature produces softer routing early in training; lower temperature approaches hard selection.
+
+#### 6.4 Parameter Counts
+
+| Component | Parameters | Trainable (DriveMoE) |
+|-----------|------------|----------------------|
+| Ego encoder | 4,736 | Frozen |
+| Road encoder | 5,184 | Frozen |
+| Partner encoder | 4,736 | Frozen |
+| Shared embedding | 49,408 | Frozen |
+| Router | 16,451 | Yes |
+| Actor (base) | 5,140 | Frozen |
+| Actor (LoRA) | 4,160 | Yes |
+| Value function | 257 | Yes |
+| **Total** | **89,872** | **20,868** |
+
+With LSTM wrapper, total parameters increase to approximately 635K.
+
+### 7. Comparison with Transformer-Based Approaches
+
+| Aspect | Drive/DriveMoE | DriveMTR/DriveMTRMoE |
+|--------|----------------|----------------------|
+| Encoder architecture | MLP + max-pool | Transformer self-attention |
+| Temporal modeling | External LSTM | Internal self-attention |
+| Computational complexity | $O(N)$ | $O(N^2)$ |
+| Parameter count | ~70K | ~1M+ |
+| Multi-modal prediction | No (single policy) | Yes ($K$ intention queries) |
+| Trajectory supervision | No | Yes (GMM NLL loss) |
+
+The Drive architecture trades representational capacity for computational efficiency, making it suitable for high-throughput simulation where millions of environment interactions are required.
+
+### 8. References
+
+1. Helbing, D., & Molnár, P. (1995). Social force model for pedestrian dynamics. *Physical Review E*, 51(5), 4282.
+
+2. Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., ... & Chen, W. (2022). LoRA: Low-rank adaptation of large language models. *ICLR*.
+
+3. Schulman, J., Wolski, F., Dhariwal, P., Radford, A., & Klimov, O. (2017). Proximal policy optimization algorithms. *arXiv preprint arXiv:1707.06347*.
+
+4. Shi, S., Jiang, L., Dai, D., & Schiele, B. (2022). Motion transformer with global intention localization and local movement refinement. *NeurIPS*.

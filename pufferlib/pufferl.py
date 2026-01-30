@@ -129,6 +129,39 @@ class PuffeRL:
         )
         self.expert_valid = torch.zeros(segments, horizon, device=device, dtype=torch.bool)
 
+        # Future trajectories for trajectory prediction loss (if traj_loss_coef > 0)
+        # Shape: (segments, horizon, num_future_frames, 2) for [x, y] in local coordinates
+        num_future_frames = config.get("num_future_frames", 40)
+        self.future_traj = torch.zeros(
+            segments,
+            horizon,
+            num_future_frames,
+            2,
+            device=device,
+            dtype=torch.float32,
+        )
+        self.future_valid = torch.zeros(
+            segments, horizon, num_future_frames, device=device, dtype=torch.bool
+        )
+
+        # Goal prediction buffers (if aux_goal_pred_coef > 0)
+        # predicted_goals: (segments, horizon, 2) for [goal_x, goal_y] in ego frame
+        # logged_goals: (segments, horizon, 2) for ground truth logged goals
+        # logged_goals_valid: (segments, horizon) validity mask
+        # agent_positions: (segments, horizon, 3) for [x, y, heading]
+        self.predicted_goals = torch.zeros(
+            segments, horizon, 2, device=device, dtype=torch.float32
+        )
+        self.logged_goals = torch.zeros(
+            segments, horizon, 2, device=device, dtype=torch.float32
+        )
+        self.logged_goals_valid = torch.zeros(
+            segments, horizon, device=device, dtype=torch.bool
+        )
+        self.agent_positions = torch.zeros(
+            segments, horizon, 3, device=device, dtype=torch.float32
+        )
+
         self.ep_lengths = torch.zeros(total_agents, device=device, dtype=torch.int32)
         self.ep_indices = torch.arange(total_agents, device=device, dtype=torch.int32)
         self.free_idx = total_agents
@@ -200,6 +233,41 @@ class PuffeRL:
             raise ValueError(f"Unknown optimizer: {config['optimizer']}")
 
         self.optimizer = optimizer
+
+        # DIAYN discriminator for expert diversity (if enabled)
+        self.diayn_enabled = config.get("diayn_enabled", False)
+        self.discriminator = None
+        self.discriminator_optimizer = None
+        if self.diayn_enabled:
+            from pufferlib.ocean.moe_adapters import create_diayn_discriminator
+
+            # Get action dimension - use stored dimension, not full action space
+            # Discrete actions are stored as indices, so dimension is 1 or len(atn_space.shape)
+            action_dim = int(np.prod(atn_space.shape)) if atn_space.shape else 1
+
+            num_experts = config.get("policy", {}).get("num_experts", 3)
+            diayn_window = config.get("diayn_trajectory_window", 16)
+            diayn_hidden = config.get("diayn_hidden_dim", 128)
+            diayn_use_conv = config.get("diayn_use_conv", False)
+
+            self.discriminator = create_diayn_discriminator(
+                obs_shape=obs_space.shape,
+                action_dim=action_dim,
+                num_experts=num_experts,
+                trajectory_window=diayn_window,
+                hidden_dim=diayn_hidden,
+                use_conv=diayn_use_conv,
+            ).to(device)
+
+            self.discriminator_optimizer = torch.optim.Adam(
+                self.discriminator.parameters(),
+                lr=config.get("diayn_lr", 0.0003),
+            )
+
+            # Buffer for expert assignments during rollout
+            self.expert_assignments = torch.zeros(
+                segments, horizon, device=device, dtype=torch.long
+            )
 
         # Logging
         self.logger = logger
@@ -328,6 +396,61 @@ class PuffeRL:
                         expert_valid, device=device
                     )
 
+                # Store future trajectories for trajectory prediction loss if available
+                if config.get("traj_loss_coef", 0) > 0 and hasattr(self.vecenv, "get_future_trajectories"):
+                    num_future_frames = config.get("num_future_frames", 40)
+                    future_traj, future_valid = self.vecenv.get_future_trajectories(num_future_frames)
+                    self.future_traj[batch_rows, l] = torch.as_tensor(
+                        future_traj, device=device, dtype=torch.float32
+                    )
+                    self.future_valid[batch_rows, l] = torch.as_tensor(
+                        future_valid, device=device, dtype=torch.bool
+                    )
+
+                # Store goal prediction data if available
+                if config.get("aux_goal_pred_coef", 0) > 0:
+                    # Store predicted goals from policy (computed during forward pass)
+                    if hasattr(self.policy, "get_goal_predictions"):
+                        goal_preds = self.policy.get_goal_predictions()
+                        if goal_preds is not None:
+                            self.predicted_goals[batch_rows, l] = goal_preds.detach()
+
+                            # Also set predicted goals on vecenv for reward computation
+                            # Goals are in scaled space (0.005 factor) as output by the policy
+                            if hasattr(self.vecenv, "set_predicted_goals"):
+                                self.vecenv.set_predicted_goals(
+                                    goal_preds[:, 0].cpu().numpy(),
+                                    goal_preds[:, 1].cpu().numpy(),
+                                )
+
+                    # Store logged goals and agent positions from environment
+                    if hasattr(self.vecenv, "get_logged_goals"):
+                        logged_goals, logged_valid = self.vecenv.get_logged_goals()
+                        self.logged_goals[batch_rows, l] = torch.as_tensor(
+                            logged_goals, device=device, dtype=torch.float32
+                        )
+                        self.logged_goals_valid[batch_rows, l] = torch.as_tensor(
+                            logged_valid, device=device, dtype=torch.bool
+                        )
+
+                    if hasattr(self.vecenv, "get_agent_positions"):
+                        positions = self.vecenv.get_agent_positions()
+                        self.agent_positions[batch_rows, l, 0] = torch.as_tensor(
+                            positions["x"], device=device, dtype=torch.float32
+                        )
+                        self.agent_positions[batch_rows, l, 1] = torch.as_tensor(
+                            positions["y"], device=device, dtype=torch.float32
+                        )
+                        self.agent_positions[batch_rows, l, 2] = torch.as_tensor(
+                            positions["heading"], device=device, dtype=torch.float32
+                        )
+
+                # Store expert assignments for DIAYN diversity objective
+                if self.diayn_enabled and hasattr(self.policy, "get_expert_assignments"):
+                    expert_assignments = self.policy.get_expert_assignments()
+                    if expert_assignments is not None:
+                        self.expert_assignments[batch_rows, l] = expert_assignments.detach()
+
                 # Note: We are not yet handling masks in this version
                 self.ep_lengths[env_id] += 1
                 if l + 1 >= config["bptt_horizon"]:
@@ -374,8 +497,53 @@ class PuffeRL:
         a = config["prio_alpha"]
         clip_coef = config["clip_coef"]
         vf_clip = config["vf_clip_coef"]
-        anneal_beta = b0 + (1 - b0) * a * self.epoch / self.total_epochs
+        anneal_beta = b0 + (1 - b0) * a * self.epoch / max(1, self.total_epochs)
         self.ratio[:] = 1
+
+        # DIAYN: Compute diversity reward and add to task rewards before advantage computation
+        if self.diayn_enabled and self.discriminator is not None:
+            diayn_coef = config.get("diayn_coef", 0.1)
+            diayn_window = config.get("diayn_trajectory_window", 16)
+            horizon = config["bptt_horizon"]
+
+            with torch.no_grad():
+                diversity_rewards = torch.zeros_like(self.rewards)
+
+                # Process in chunks to avoid OOM
+                chunk_size = min(2048, self.segments)
+                num_chunks = (self.segments + chunk_size - 1) // chunk_size
+
+                for chunk_idx in range(num_chunks):
+                    start_seg = chunk_idx * chunk_size
+                    end_seg = min((chunk_idx + 1) * chunk_size, self.segments)
+                    chunk_segments = end_seg - start_seg
+
+                    # Build trajectory for this chunk
+                    obs_chunk = self.observations[start_seg:end_seg].reshape(chunk_segments, horizon, -1)
+                    act_chunk = self.actions[start_seg:end_seg].reshape(chunk_segments, horizon, -1).float()
+                    traj_chunk = torch.cat([obs_chunk, act_chunk], dim=-1)
+
+                    for t in range(horizon):
+                        start_t = max(0, t - diayn_window + 1)
+                        window = traj_chunk[:, start_t : t + 1, :]
+
+                        # Pad if window is smaller than diayn_window
+                        if window.shape[1] < diayn_window:
+                            pad_size = diayn_window - window.shape[1]
+                            pad = torch.zeros(chunk_segments, pad_size, window.shape[2], device=device)
+                            window = torch.cat([pad, window], dim=1)
+
+                        expert_idx = self.expert_assignments[start_seg:end_seg, t]
+                        div_reward = self.discriminator.compute_diversity_reward(window, expert_idx)
+                        diversity_rewards[start_seg:end_seg, t] = div_reward
+
+                    del traj_chunk, obs_chunk, act_chunk
+
+                # Add diversity reward to task rewards
+                self.rewards = self.rewards + diayn_coef * diversity_rewards
+
+                # Log mean diversity reward
+                losses["diayn_diversity_reward"] = diversity_rewards.mean().item()
 
         for mb in range(self.total_minibatches):
             profile("train_misc", epoch, nest=True)
@@ -508,6 +676,27 @@ class PuffeRL:
                 else:
                     losses["imit_loss"] += 0.0
 
+            # Add trajectory prediction loss if traj_loss_coef > 0
+            traj_loss_coef = config.get("traj_loss_coef", 0.0)
+            if traj_loss_coef > 0 and hasattr(self.policy, "get_trajectory_loss"):
+                mb_future_traj = self.future_traj[idx]  # (batch, horizon, T, 2)
+                mb_future_valid = self.future_valid[idx]  # (batch, horizon, T)
+
+                # Reshape for loss computation: (batch * horizon, T, 2) and (batch * horizon, T)
+                mb_future_traj = mb_future_traj.reshape(-1, mb_future_traj.shape[-2], 2)
+                mb_future_valid = mb_future_valid.reshape(-1, mb_future_valid.shape[-1])
+
+                # Check if any valid trajectories exist
+                if mb_future_valid.any():
+                    traj_loss = self.policy.get_trajectory_loss(
+                        gt_future_traj=mb_future_traj,
+                        gt_valid_mask=mb_future_valid.float(),
+                    )
+                    loss = loss + traj_loss_coef * traj_loss
+                    losses["traj_loss"] = losses.get("traj_loss", 0.0) + traj_loss.item() / self.total_minibatches
+                else:
+                    losses["traj_loss"] = losses.get("traj_loss", 0.0)
+
             # Add MoE auxiliary losses if policy supports them
             if hasattr(self.policy, "get_auxiliary_losses"):
                 aux_losses = self.policy.get_auxiliary_losses(config=config)
@@ -517,6 +706,20 @@ class PuffeRL:
                     if coef > 0 and aux_loss is not None:
                         loss = loss + coef * aux_loss
                         losses[f"aux_{loss_name}"] += aux_loss.item() / self.total_minibatches
+
+            # Add goal prediction loss if aux_goal_pred_coef > 0
+            goal_pred_coef = config.get("aux_goal_pred_coef", 0.0)
+            if goal_pred_coef > 0 and hasattr(self.policy, "get_goal_prediction_loss"):
+                mb_logged_goals = self.logged_goals[idx]  # (batch, horizon, 2)
+                mb_logged_valid = self.logged_goals_valid[idx]  # (batch, horizon)
+
+                # Reshape for loss computation: (batch * horizon, 2) and (batch * horizon,)
+                mb_logged_goals = mb_logged_goals.reshape(-1, 2)
+                mb_logged_valid = mb_logged_valid.reshape(-1)
+
+                goal_pred_loss = self.policy.get_goal_prediction_loss(mb_logged_goals, mb_logged_valid)
+                loss = loss + goal_pred_coef * goal_pred_loss
+                losses["goal_pred_loss"] = losses.get("goal_pred_loss", 0.0) + goal_pred_loss.item() / self.total_minibatches
 
             self.amp_context.__enter__()  # TODO: AMP needs some debugging
 
@@ -558,6 +761,67 @@ class PuffeRL:
         if hasattr(self.policy, "update_temperature"):
             progress = self.global_step / config["total_timesteps"]
             self.policy.update_temperature(progress, config)
+
+        # DIAYN: Train discriminator to classify trajectories by expert
+        if self.diayn_enabled and self.discriminator is not None:
+            diayn_window = config.get("diayn_trajectory_window", 16)
+            horizon = self.values.shape[1]
+
+            # Build trajectory features (obs + actions) - keep on CPU to save GPU memory
+            obs_flat = self.observations.view(self.segments, horizon, -1).float()
+            act_flat = self.actions.view(self.segments, horizon, -1).float()
+            trajectories = torch.cat([obs_flat, act_flat], dim=-1)
+
+            # Sample a subset of (segment, timestep) pairs for training
+            # This avoids OOM from processing all segments * horizon samples
+            disc_batch_size = min(4096, self.segments * horizon)
+            total_samples = self.segments * horizon
+
+            # Random sample indices
+            sample_indices = torch.randperm(total_samples)[:disc_batch_size]
+            seg_indices = sample_indices // horizon
+            t_indices = sample_indices % horizon
+
+            # Build windows for sampled indices
+            disc_windows = []
+            disc_experts = []
+
+            for i in range(disc_batch_size):
+                seg = seg_indices[i].item()
+                t = t_indices[i].item()
+                start_t = max(0, t - diayn_window + 1)
+                window = trajectories[seg, start_t : t + 1, :]  # (window_len, features)
+
+                # Pad if window is smaller than diayn_window
+                if window.shape[0] < diayn_window:
+                    pad_size = diayn_window - window.shape[0]
+                    pad = torch.zeros(pad_size, window.shape[1], device=window.device)
+                    window = torch.cat([pad, window], dim=0)
+
+                disc_windows.append(window)
+                disc_experts.append(self.expert_assignments[seg, t])
+
+            # Stack: (disc_batch_size, diayn_window, features)
+            disc_windows = torch.stack(disc_windows, dim=0).to(device)
+            disc_experts = torch.stack(disc_experts, dim=0).to(device)
+
+            # Train discriminator with cross-entropy loss
+            self.discriminator_optimizer.zero_grad()
+            disc_loss = self.discriminator.compute_discriminator_loss(disc_windows, disc_experts)
+            disc_loss.backward()
+            self.discriminator_optimizer.step()
+
+            # Compute discriminator accuracy for logging
+            with torch.no_grad():
+                disc_logits = self.discriminator(disc_windows)
+                disc_preds = disc_logits.argmax(dim=-1)
+                disc_accuracy = (disc_preds == disc_experts).float().mean().item()
+
+            losses["diayn_disc_loss"] = disc_loss.item()
+            losses["diayn_disc_accuracy"] = disc_accuracy
+
+            # Free memory
+            del disc_windows, disc_experts, trajectories
 
         y_pred = self.values.flatten()
         y_true = advantages.flatten() + self.values.flatten()
@@ -1519,7 +1783,11 @@ def load_env(env_name, args):
     module_name = "pufferlib.ocean" if package == "ocean" else f"pufferlib.environments.{package}"
     env_module = importlib.import_module(module_name)
     make_env = env_module.env_creator(env_name)
-    return pufferlib.vector.make(make_env, env_kwargs=args["env"], **args["vec"])
+    # Pass num_future_frames from policy config for trajectory loss buffer allocation
+    vec_kwargs = dict(**args["vec"])
+    if "num_future_frames" in args.get("policy", {}):
+        vec_kwargs["num_future_frames"] = args["policy"]["num_future_frames"]
+    return pufferlib.vector.make(make_env, env_kwargs=args["env"], **vec_kwargs)
 
 
 def load_policy(args, vecenv, env_name=""):
