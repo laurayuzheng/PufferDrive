@@ -13,13 +13,21 @@ from pufferlib.ocean.polysona_utils import adapter_utils
 Recurrent = pufferlib.models.LSTMWrapper
 
 
+TRAINABLE_PARAMS = [
+    "skills_weight_",
+    "expert_weight_",
+    "persona_classifier",
+    "lora_"
+]
+
 class DrivePolysona(nn.Module):
-    def __init__(self, 
-                 env, 
-                 num_personas=3, 
-                 prior=None, 
-                 input_size=128, 
-                 hidden_size=128, 
+    def __init__(self,
+                 env,
+                 num_personas=3,
+                 prior=None,
+                 input_size=128,
+                 hidden_size=128,
+                 lora_rank=8,
                  **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
@@ -82,6 +90,7 @@ class DrivePolysona(nn.Module):
 
         self.skilled_variant = 'private'  # standard mixture of LoRA
         self.mixin_class = polytropon.VARIANT2CLASS[self.skilled_variant][0]
+        self.lora_rank = lora_rank
         self.persona_classifier = None
 
         # Initialize router
@@ -98,8 +107,11 @@ class DrivePolysona(nn.Module):
         # Applies LoRA wrapping to ego, partner, and actor module.
         self.wrap_model_with_mixins()
 
+        # freeze all params except intended trainable params.
+        self.freeze_all_but_adapters()
 
-    def _wrap_mixin(self, model: nn.Module, attention_only=True):
+
+    def _wrap_mixin(self, model: nn.Module, attention_only=False):
         """Generic helper to wrap a module with the manual skilled mixin class."""
         return (
             polytropon.SkilledMixin(
@@ -123,6 +135,16 @@ class DrivePolysona(nn.Module):
         # self.shared_embedding = self._wrap_mixin(self.shared_embedding)
         self.actor = self._wrap_mixin(self.actor)
     
+    def freeze_all_but_adapters(self):
+    # freeze all weights except persona head and LoRA weights
+
+        for name, param in self.named_parameters():
+            if any([trainable_param in name for trainable_param in TRAINABLE_PARAMS]):
+                param.requires_grad = True
+                # print("Set requires grad True for param: ", name)
+            else:
+                param.requires_grad = False
+
     def broadcast_expert_indices(self, z):
         """Informs all Mixin layers of current expert indices."""
 

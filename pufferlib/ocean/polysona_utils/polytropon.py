@@ -1,6 +1,5 @@
 import logging
 import math
-from scipy import special
 from typing import Union
 
 import torch

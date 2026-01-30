@@ -7,6 +7,7 @@ import pufferlib.models
 
 from pufferlib.models import Default as Policy  # noqa: F401
 from pufferlib.models import Convolutional as Conv  # noqa: F401
+from pufferlib.ocean.polysona import DrivePolysona  # noqa: F401
 
 
 Recurrent = pufferlib.models.LSTMWrapper
@@ -67,6 +68,9 @@ class Drive(nn.Module):
         return actions, value
 
     def forward_train(self, x, state=None):
+        return self.forward(x, state)
+    
+    def forward_eval(self, x, state=None):
         return self.forward(x, state)
 
     def encode_observations(self, observations, state=None):

@@ -1,6 +1,10 @@
 import torch
 from torch import nn
-import loralib as lora
+
+try:
+    import loralib as lora
+except ImportError:
+    lora = None
 
 ATTENTION_LINEARS = [
     'ca_',

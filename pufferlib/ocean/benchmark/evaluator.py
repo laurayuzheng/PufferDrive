@@ -88,6 +88,11 @@ class WOSACEvaluator:
             "id": np.zeros((num_agents, self.num_rollouts, self.sim_steps), dtype=np.int32),
         }
 
+        # Polysona: track inferred latent indices for analysis
+        is_polysona = hasattr(policy, "num_personas") and policy.num_personas > 0
+        if is_polysona:
+            trajectories["latent"] = np.zeros((num_agents, self.num_rollouts, self.sim_steps), dtype=np.int32)
+
         for rollout_idx in range(self.num_rollouts):
             print(f"\rCollecting rollout {rollout_idx + 1}/{self.num_rollouts}...", end="", flush=True)
             obs, info = puffer_env.reset()
@@ -110,7 +115,14 @@ class WOSACEvaluator:
                 # Step policy
                 with torch.no_grad():
                     ob_tensor = torch.as_tensor(obs).to(device)
-                    logits, value = policy.forward_eval(ob_tensor, state)
+                    policy_output = policy.forward_eval(ob_tensor, state)
+                    # Handle polysona (3 outputs) vs standard policy (2 outputs)
+                    if len(policy_output) == 3:
+                        logits, value, latent_pred = policy_output
+                        # Store inferred latent (argmax of logits)
+                        trajectories["latent"][:, rollout_idx, time_idx] = latent_pred.argmax(dim=-1).cpu().numpy()
+                    else:
+                        logits, value = policy_output
                     action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                     action_np = action.cpu().numpy().reshape(puffer_env.action_space.shape)
 
@@ -663,7 +675,12 @@ class HumanReplayEvaluator:
             # Step policy
             with torch.no_grad():
                 ob_tensor = torch.as_tensor(obs).to(device)
-                logits, value = policy.forward_eval(ob_tensor, state)
+                policy_output = policy.forward_eval(ob_tensor, state)
+                # Handle polysona (3 outputs) vs standard policy (2 outputs)
+                if len(policy_output) == 3:
+                    logits, value, latent_pred = policy_output
+                else:
+                    logits, value = policy_output
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 action_np = action.cpu().numpy().reshape(puffer_env.action_space.shape)
 

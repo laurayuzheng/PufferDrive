@@ -163,10 +163,11 @@ class PuffeRL:
                 pufferlib.pytorch.sample_logits, mode=config["compile_mode"]
             )
 
-        # Optimizer
+        # Optimizer - only optimize parameters that require gradients
+        trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
         if config["optimizer"] == "adam":
             optimizer = torch.optim.Adam(
-                self.policy.parameters(),
+                trainable_params,
                 lr=config["learning_rate"],
                 betas=(config["adam_beta1"], config["adam_beta2"]),
                 eps=config["adam_eps"],
@@ -179,7 +180,7 @@ class PuffeRL:
 
             heavyball.utils.compile_mode = config["compile_mode"] if config["compile"] else None
             optimizer = ForeachMuon(
-                self.policy.parameters(),
+                trainable_params,
                 lr=config["learning_rate"],
                 betas=(config["adam_beta1"], config["adam_beta2"]),
                 eps=config["adam_eps"],
@@ -223,6 +224,24 @@ class PuffeRL:
 
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+
+        # Polysona/DIAYN support - only initialize if policy has num_personas
+        self.use_polysona = hasattr(policy, "num_personas") and policy.num_personas > 0
+        if self.use_polysona:
+            num_personas = policy.num_personas
+            # Per-agent current latent (stays constant within episode, resampled on reset)
+            self.current_z = torch.zeros(total_agents, device=device, dtype=torch.long)
+            # Buffer to store z for each timestep (same shape as rewards)
+            self.sampled_z = torch.zeros(segments, horizon, device=device, dtype=torch.long)
+            # Buffer to store latent predictions for discriminator loss
+            self.latent_preds = torch.zeros(segments, horizon, num_personas, device=device)
+            # Diversity reward coefficient from config (default 0 = disabled)
+            self.diversity_reward_lambda = config.get("diversity_reward_lambda", 0.0)
+            # Discriminator loss coefficient from config
+            self.discriminator_loss_coef = config.get("discriminator_loss_coef", 1.0)
+            # Sample initial z for all agents
+            self._sample_initial_latents(policy)
+
         self.print_dashboard(clear=True)
 
     @property
@@ -235,6 +254,26 @@ class PuffeRL:
             return 0
 
         return (self.global_step - self.last_log_step) / (time.time() - self.last_log_time)
+
+    def _sample_initial_latents(self, policy):
+        """Sample initial latents for all agents from the prior distribution."""
+        num_personas = policy.num_personas
+        prior = policy.persona_prior.to(self.config["device"])
+        self.current_z = torch.multinomial(prior.expand(self.total_agents, -1), 1).squeeze(-1)
+
+    def _resample_latents_for_done(self, done_mask, env_id):
+        """Resample latents for agents whose episodes have ended."""
+        if not done_mask.any():
+            return
+        policy = self.uncompiled_policy
+        num_personas = policy.num_personas
+        prior = policy.persona_prior.to(self.config["device"])
+        # Get indices of done agents
+        done_indices = torch.where(done_mask)[0] + env_id.start
+        num_done = done_indices.shape[0]
+        if num_done > 0:
+            new_z = torch.multinomial(prior.expand(num_done, -1), 1).squeeze(-1)
+            self.current_z[done_indices] = new_z
 
     def evaluate(self):
         profile = self.profile
@@ -280,7 +319,14 @@ class PuffeRL:
                     state["lstm_h"] = self.lstm_h[env_id.start]
                     state["lstm_c"] = self.lstm_c[env_id.start]
 
-                logits, value = self.policy.forward_eval(o_device, state)
+                # Polysona: pass current z to forward_eval
+                latent_pred = None
+                if self.use_polysona:
+                    current_z = self.current_z[env_id]
+                    logits, value, latent_pred = self.policy.forward_eval(o_device, state, z=current_z)
+                else:
+                    logits, value = self.policy.forward_eval(o_device, state)
+
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 r = torch.clamp(r, -1, 1)
 
@@ -304,6 +350,20 @@ class PuffeRL:
                 self.rewards[batch_rows, l] = r
                 self.terminals[batch_rows, l] = d.float()
                 self.values[batch_rows, l] = value.flatten()
+
+                # Polysona: store z, latent predictions, and add diversity reward
+                if self.use_polysona:
+                    current_z = self.current_z[env_id]
+                    self.sampled_z[batch_rows, l] = current_z
+                    self.latent_preds[batch_rows, l] = latent_pred
+                    # Compute diversity reward and add to task reward
+                    if self.diversity_reward_lambda != 0:
+                        diversity_reward = self.uncompiled_policy.compute_skill_reward(
+                            latent_pred, current_z.unsqueeze(-1)
+                        ).squeeze(-1)
+                        self.rewards[batch_rows, l] += self.diversity_reward_lambda * diversity_reward
+                    # Resample z for agents that are done
+                    self._resample_latents_for_done(d.bool(), env_id)
 
                 # Note: We are not yet handling masks in this version
                 self.ep_lengths[env_id] += 1
@@ -389,9 +449,16 @@ class PuffeRL:
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
 
+            # Polysona: get minibatch z values
+            mb_z = None
+            if self.use_polysona:
+                mb_z = self.sampled_z[idx]
+
             profile("train_forward", epoch)
             if not config["use_rnn"]:
                 mb_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
+                if self.use_polysona:
+                    mb_z = mb_z.reshape(-1)
 
             state = dict(
                 action=mb_actions,
@@ -399,7 +466,12 @@ class PuffeRL:
                 lstm_c=None,
             )
 
-            logits, newvalue = self.policy(mb_obs, state)
+            # Polysona: pass z to forward and get latent predictions
+            latent_pred = None
+            if self.use_polysona:
+                logits, newvalue, latent_pred = self.policy(mb_obs, state, z=mb_z)
+            else:
+                logits, newvalue = self.policy(mb_obs, state)
             actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
 
             profile("train_misc", epoch)
@@ -442,6 +514,14 @@ class PuffeRL:
             entropy_loss = entropy.mean()
 
             loss = pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss
+
+            # Polysona: add discriminator loss for DIAYN
+            discriminator_loss = torch.tensor(0.0, device=device)
+            if self.use_polysona and latent_pred is not None:
+                # Cross-entropy loss to train persona classifier to predict z from state
+                discriminator_loss = torch.nn.functional.cross_entropy(latent_pred, mb_z)
+                loss = loss + self.discriminator_loss_coef * discriminator_loss
+
             self.amp_context.__enter__()  # TODO: AMP needs some debugging
 
             # This breaks vloss clipping?
@@ -452,6 +532,8 @@ class PuffeRL:
             losses["policy_loss"] += pg_loss.item() / self.total_minibatches
             losses["value_loss"] += v_loss.item() / self.total_minibatches
             losses["entropy"] += entropy_loss.item() / self.total_minibatches
+            if self.use_polysona:
+                losses["discriminator_loss"] += discriminator_loss.item() / self.total_minibatches
             losses["old_approx_kl"] += old_approx_kl.item() / self.total_minibatches
             losses["approx_kl"] += approx_kl.item() / self.total_minibatches
             losses["clipfrac"] += clipfrac.item() / self.total_minibatches
@@ -494,7 +576,12 @@ class PuffeRL:
             self.msg = f"Checkpoint saved at update {self.epoch}"
 
             if self.render and self.epoch % self.render_interval == 0:
-                model_dir = os.path.join(self.config["data_dir"], f"{self.config['env']}_{self.logger.run_id}")
+                exp_name = self.config.get("exp_name")
+                if exp_name:
+                    dir_name = f"{exp_name}_{self.config['env']}_{self.logger.run_id}"
+                else:
+                    dir_name = f"{self.config['env']}_{self.logger.run_id}"
+                model_dir = os.path.join(self.config["data_dir"], dir_name)
                 model_files = glob.glob(os.path.join(model_dir, "model_*.pt"))
 
                 if model_files:
@@ -573,7 +660,12 @@ class PuffeRL:
         self.utilization.stop()
         model_path = self.save_checkpoint()
         run_id = self.logger.run_id
-        path = os.path.join(self.config["data_dir"], f"{self.config['env']}_{run_id}.pt")
+        exp_name = self.config.get("exp_name")
+        if exp_name:
+            final_name = f"{exp_name}_{self.config['env']}_{run_id}.pt"
+        else:
+            final_name = f"{self.config['env']}_{run_id}.pt"
+        path = os.path.join(self.config["data_dir"], final_name)
         shutil.copy(model_path, path)
         return path
 
@@ -583,11 +675,20 @@ class PuffeRL:
                 return
 
         run_id = self.logger.run_id
-        path = os.path.join(self.config["data_dir"], f"{self.config['env']}_{run_id}")
+        exp_name = self.config.get("exp_name")
+        # Include exp_name in directory and model naming if provided
+        if exp_name:
+            dir_name = f"{exp_name}_{self.config['env']}_{run_id}"
+            model_prefix = f"model_{exp_name}_{self.config['env']}"
+        else:
+            dir_name = f"{self.config['env']}_{run_id}"
+            model_prefix = f"model_{self.config['env']}"
+
+        path = os.path.join(self.config["data_dir"], dir_name)
         if not os.path.exists(path):
             os.makedirs(path)
 
-        model_name = f"model_{self.config['env']}_{self.epoch:06d}.pt"
+        model_name = f"{model_prefix}_{self.epoch:06d}.pt"
         model_path = os.path.join(path, model_name)
         if os.path.exists(model_path):
             return model_path
@@ -933,15 +1034,25 @@ class WandbLogger:
     def __init__(self, args, load_id=None, resume="allow"):
         import wandb
 
+        run_id = load_id or wandb.util.generate_id()
+        # Prepend exp_name to run name if provided
+        exp_name = args.get("exp_name")
+        if args.get("wandb_name"):
+            run_name = args["wandb_name"]
+        elif exp_name:
+            run_name = f"{exp_name}_{run_id}"
+        else:
+            run_name = None
+
         wandb.init(
-            id=load_id or wandb.util.generate_id(),
+            id=run_id,
             project=args["wandb_project"],
             group=args["wandb_group"],
             allow_val_change=True,
             save_code=False,
             resume=resume,
             config=args,
-            name=args.get("wandb_name"),
+            name=run_name,
             tags=[args["tag"]] if args["tag"] is not None else [],
         )
         self.wandb = wandb
@@ -997,7 +1108,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     elif args["wandb"]:
         logger = WandbLogger(args)
 
-    train_config = dict(**args["train"], env=env_name, eval=args.get("eval", {}))
+    train_config = dict(**args["train"], env=env_name, eval=args.get("eval", {}), exp_name=args.get("exp_name"))
     pufferl = PuffeRL(train_config, vecenv, policy, logger)
 
     all_logs = []
@@ -1333,7 +1444,7 @@ def profile(args=None, env_name=None, vecenv=None, policy=None):
     vecenv = vecenv or load_env(env_name, args)
     policy = policy or load_policy(args, vecenv)
 
-    train_config = dict(**args["train"], env=args["env_name"], tag=args["tag"])
+    train_config = dict(**args["train"], env=args["env_name"], tag=args["tag"], exp_name=args.get("exp_name"))
     pufferl = PuffeRL(train_config, vecenv, policy, neptune=args["neptune"], wandb=args["wandb"])
 
     from torch.profiler import profile, record_function, ProfilerActivity
@@ -1403,7 +1514,9 @@ def load_env(env_name, args):
     package = args["package"]
     module_name = "pufferlib.ocean" if package == "ocean" else f"pufferlib.environments.{package}"
     env_module = importlib.import_module(module_name)
-    make_env = env_module.env_creator(env_name)
+    # Use first name from config's env_name field (supports aliases like "puffer_drive polysona")
+    base_env_name = args["env_name"].split()[0]
+    make_env = env_module.env_creator(base_env_name)
     return pufferlib.vector.make(make_env, env_kwargs=args["env"], **args["vec"])
 
 
@@ -1413,8 +1526,12 @@ def load_policy(args, vecenv, env_name=""):
     env_module = importlib.import_module(module_name)
 
     device = args["train"]["device"]
+    # Extract base_checkpoint from policy args before passing to constructor
+    policy_args = {k: v for k, v in args["policy"].items() if k != "base_checkpoint"}
+    base_checkpoint = args["policy"].get("base_checkpoint", None)
+
     policy_cls = getattr(env_module.torch, args["policy_name"])
-    policy = policy_cls(vecenv.driver_env, **args["policy"])
+    policy = policy_cls(vecenv.driver_env, **policy_args)
 
     rnn_name = args["rnn_name"]
     if rnn_name is not None:
@@ -1422,6 +1539,21 @@ def load_policy(args, vecenv, env_name=""):
         policy = rnn_cls(vecenv.driver_env, policy, **args["rnn"])
 
     policy = policy.to(device)
+
+    # Polysona: load base checkpoint with strict=False (allows missing LoRA/classifier params)
+    if base_checkpoint is not None and base_checkpoint != "None":
+        print(f"Loading base checkpoint: {base_checkpoint}")
+        state_dict = torch.load(base_checkpoint, map_location=device)
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        missing, unexpected = policy.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"  Missing keys (expected for polysona): {len(missing)} keys")
+        if unexpected:
+            print(f"  Unexpected keys: {unexpected}")
+        # Re-freeze base weights after loading checkpoint
+        if hasattr(policy, "freeze_all_but_adapters"):
+            policy.freeze_all_but_adapters()
+            print("  Re-froze base weights after checkpoint loading")
 
     load_id = args["load_id"]
     if load_id is not None:
@@ -1477,6 +1609,7 @@ def load_config(env_name, config_dir=None):
     parser.add_argument("--neptune-project", type=str, default="ablations")
     parser.add_argument("--local-rank", type=int, default=0, help="Used by torchrun for DDP")
     parser.add_argument("--tag", type=str, default=None, help="Tag for experiment")
+    parser.add_argument("--exp-name", type=str, default=None, help="Experiment name (prepended to wandb run name)")
     parser.add_argument("--sanity-maps", nargs="*", default=None, help="Optional list of sanity map base names to run")
     args = parser.parse_known_args()[0]
 

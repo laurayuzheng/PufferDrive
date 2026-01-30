@@ -126,7 +126,7 @@ class LSTMWrapper(nn.Module):
         # self.pre_layernorm = nn.LayerNorm(hidden_size)
         # self.post_layernorm = nn.LayerNorm(hidden_size)
 
-    def forward_eval(self, observations, state):
+    def forward_eval(self, observations, state, z=None):
         """Forward function for inference. 3x faster than using LSTM directly"""
         hidden = self.policy.encode_observations(observations, state=state)
         h = state["lstm_h"]
@@ -145,10 +145,31 @@ class LSTMWrapper(nn.Module):
         state["hidden"] = hidden
         state["lstm_h"] = hidden
         state["lstm_c"] = c
+
+        # Polysona support: compute latent prediction and set task_ids for LoRA
+        latent_pred = None
+        if hasattr(self.policy, "num_personas") and self.policy.num_personas > 0:
+            latent_pred = self.policy.compute_q_z_given_s(hidden)
+            # Use provided z or infer from state
+            if z is None:
+                z_for_lora = latent_pred  # Already logits
+            else:
+                # Convert integer indices to one-hot for LoRA layers
+                if z.dtype in (torch.long, torch.int, torch.int32, torch.int64):
+                    z_for_lora = torch.nn.functional.one_hot(
+                        z, num_classes=self.policy.num_personas
+                    ).float()
+                else:
+                    z_for_lora = z
+            self.policy.broadcast_expert_indices(z_for_lora)
+
         logits, values = self.policy.decode_actions(hidden)
+
+        if latent_pred is not None:
+            return logits, values, latent_pred
         return logits, values
 
-    def forward(self, observations, state):
+    def forward(self, observations, state, z=None):
         """Forward function for training. Uses LSTM for fast time-batching"""
         x = observations
         lstm_h = state["lstm_h"]
@@ -187,12 +208,35 @@ class LSTMWrapper(nn.Module):
         hidden = hidden.transpose(0, 1)
 
         flat_hidden = hidden.reshape(B * TT, self.hidden_size)
+
+        # Polysona support: compute latent prediction and set task_ids for LoRA
+        latent_pred = None
+        if hasattr(self.policy, "num_personas") and self.policy.num_personas > 0:
+            latent_pred = self.policy.compute_q_z_given_s(flat_hidden)
+            # Use provided z or infer from state
+            if z is None:
+                z_for_lora = latent_pred  # Already logits
+            else:
+                # Convert integer indices to one-hot for LoRA layers
+                # z might have shape [B, TT] for training, need to flatten
+                z_flat = z.reshape(-1) if z.ndim > 1 else z
+                if z_flat.dtype in (torch.long, torch.int, torch.int32, torch.int64):
+                    z_for_lora = torch.nn.functional.one_hot(
+                        z_flat, num_classes=self.policy.num_personas
+                    ).float()
+                else:
+                    z_for_lora = z_flat
+            self.policy.broadcast_expert_indices(z_for_lora)
+
         logits, values = self.policy.decode_actions(flat_hidden)
         values = values.reshape(B, TT)
         # state.batch_logits = logits.reshape(B, TT, -1)
         state["hidden"] = hidden
         state["lstm_h"] = lstm_h.detach()
         state["lstm_c"] = lstm_c.detach()
+
+        if latent_pred is not None:
+            return logits, values, latent_pred
         return logits, values
 
 

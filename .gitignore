@@ -193,3 +193,6 @@ docs/book/*
 
 # Visualization output
 viz_output/
+
+# Experiment files
+experiments_moe/
